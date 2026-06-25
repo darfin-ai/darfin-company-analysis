@@ -54,3 +54,6 @@ gradle/wrapper/gradle-wrapper.properties
 .gradle/
 build.gradle.kts
 settings.gradle.kts
+
+# 보안! 절대 커밋 금지
+.env
