@@ -1,0 +1,56 @@
+# Build output
+build/
+target/
+bin/
+out/
+*.class
+*.war
+*.ear
+
+# Tomcat / servlet runtime files
+logs/
+temp/
+work/
+localhost.*.log
+catalina*.log
+host-manager.*.log
+manager.*.log
+
+# Eclipse / Java IDE
+.classpath
+.project
+.settings/
+.metadata/
+.recommenders/
+.apt_generated/
+.factorypath
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# Maven / Gradle caches
+build.gradle
+/.gradle/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# lib
+**/webapp/WEB-INF/lib/*.jar
+
+# Gradle Wrapper
+gradlew
+gradlew.bat
+gradle/wrapper/gradle-wrapper.jar
+gradle/wrapper/gradle-wrapper.properties
+
+# Gradle Build Output
+.build/
+.gradle/
+build.gradle.kts
+settings.gradle.kts
