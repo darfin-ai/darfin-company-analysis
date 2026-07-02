@@ -57,3 +57,8 @@ settings.gradle.kts
 
 # 보안! 절대 커밋 금지
 .env
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

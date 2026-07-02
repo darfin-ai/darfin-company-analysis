@@ -103,7 +103,13 @@ DART Open API ──▶ [darfin-company-analysis (Python/FastAPI)]          [dar
 
 ## 5. 구현 순서
 
-1. **파서 먼저, 오프라인으로** — `darfin-front/삼성전자 분기보고서/`의 2023~2026 XML 4개가 완벽한 테스트 픽스처. 섹션 분할 + `AASSOCNOTE` 매칭 + 표 추출기를 연도 간 포맷 변화에 대해 검증.
+1. ~~**파서 먼저, 오프라인으로**~~ ✅ **완료** — `dart_parser/` 패키지 + `scripts/validate_fixtures.py`. 4개년 픽스처 전체 검증 통과 (표준 섹션 12/12 매핑, 연도 간 AASSOCNOTE 매칭 100%, 재무 수치 스팟체크 실제 공시값과 일치). 구현하며 확인된 DART XML의 실제 구조(문서화 안 된 함정들):
+   - **파일이 well-formed XML이 아님**: `</DOCUMENT>` 뒤 중복 잔여물(최대 1.3MB), 이스케이프 안 된 `&`(파일당 수백 개), 깨진 UTF-8 바이트 → `loader.py`가 절단·치환 후 lxml recover 모드로 파싱, 전 과정 warnings로 기록
+   - **섹션 분할 단위는 SECTION 컨테이너가 아니라 TITLE**: 한 컨테이너에 TITLE 여러 개 (두 번째부터는 가상 하위 섹션)
+   - **LIBRARY는 투명 래퍼**: 사업의 내용 하위 섹션·재무제표가 그 아래에 숨어 있음
+   - **재무제표 인코딩이 연도마다 다름 (3가지 형식)**: ①2023 = 캡션 표 + 본문 표 쌍(TITLE 없음, ACODE 없음) → 캡션 표에서 가상 섹션 합성 + 라벨 기반 수치 추출, ②2024 = TITLE 있는 TABLE-GROUP이지만 ACODE 없음 → 라벨 기반 추출, ③2025~2026 = TE 셀에 ACODE/ACONTEXT/ADECIMAL 완비 → concept 기반 추출
+   - **ATOCID는 2023 파일에 없음** → 앵커는 AASSOCNOTE > breadcrumb 순으로 사용 (계획대로)
+   - **ACONTEXT 접두사(C/P)로 당기/전기 판별** 가능, 라벨 기반일 때는 머리글의 제N기 번호로 판별
 2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과)
 3. 수치 + 해시 기반 diff 엔진 → 공시 변경 탭의 수치형 섹션
 4. LLM 단계 (기존 `main.py`의 Gemini 스텁을 raw-text 엔드포인트에서 구조화된 diff 단위 호출로 확장) → 서술형 diff, findings, insights, scores
