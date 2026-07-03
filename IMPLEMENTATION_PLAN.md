@@ -119,13 +119,22 @@ DART Open API ──▶ [darfin-company-analysis (Python/FastAPI)]          [dar
    - `dart_parser/loader.py`에 인코딩 스니핑 추가 (구형 문서 EUC-KR 대비)
    - corpCode.xml은 `data/corp_codes.zip`에 24시간 캐시
    - **미구현(5번에서)**: 일일 폴링 스케줄러
+1-c. **파싱 결과 적재 (Stage 2 PARSED)** ✅ **완료** — `dart_pipeline/parse_ingest.py`(오케스트레이션) + `scripts/parse_filings.py` CLI. RAW filings의 `xml_path`를 `dart_parser`로 파싱해 `text_chunks`에 적재하고 `pipeline_status`를 PARSED로 갱신 — 1-b(수집)와 2(재무수치) 사이에 있었던 빈틈으로, diff 엔진(3번)이 텍스트/구조형 비교를 하려면 이 단계가 선행되어야 함. 이미 받아둔 XML을 대상으로 하므로 **DART API 호출 없이 완전히 오프라인으로 동작**(corp_code 조회용 corpCode.xml 캐시만 필요). 검증: 삼성전자 14건 전체 파싱 → `text_chunks` 1,584행 적재, 재실행 시 기본은 skip·`--force`로 재파싱해도 동일 결과(멱등), Q3 2023 파일도 표준 섹션 12/12가 `canonical_label`로 정상 보존됨, 연도 간 `assoc_note` 매칭도 DB 조회로 재확인(2025 3분기→2025 사업보고서 46건 일치). 구현 노트:
+   - `section_title`/`breadcrumb`는 각각 VARCHAR(200)/(500)이라 truncate — 실측 최대값은 738자/784자(주석 섹션 중 일부는 TITLE 자리에 문단 전체가 들어오는 사례가 있어 예상보다 김). 표시용 라벨이 아니라 앵커 매칭(`assoc_note`/`atocid`)이 우선이라 truncate 자체는 문제 없음
+   - `tables_json`은 표가 있는 섹션만 채움(NULL 허용), 실측 최대 크기 ~1.5MB — DB `max_allowed_packet`(16MB) 내로 여유 있음
+   - **이번에 발견**: 로컬 개발 DB(`darfin_dev`)의 `filings` 테이블이 비어 있었음(1-b에서 라이브 수집했다는 기록과 불일치 — 이후 DB가 리셋된 것으로 보임). 이 환경(네트워크 이슈로 라이브 수집 재실행 불가)에선 로컬 XML 자체의 메타데이터(`rcept_no` 앞 8자리=접수일, `parse_filing()`의 `period_to`/`doc_acode`)로 `filings`를 재시딩해 테스트함. 단, 분기보고서는 XML 내부 `DOCUMENT-NAME ACODE`가 1분기/3분기 구분 없이 항상 "11013"이므로(`ingest.py: classify_report()`가 API의 `report_nm` 월로 구분하는 것과 같은 이유) `period_to` 종료월(03→11013, 09→11014)로 직접 보정 — 라이브 수집 경로(`ingest_company`)는 이미 `report_nm` 기반이라 이 문제 없음
 2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과) ✅ **코드 완료, 라이브 검증 대기** — `dart_pipeline/metrics.py`(순수 변환, XML 무관) + `metrics_ingest.py`(오케스트레이션) + `scripts/fetch_metrics.py` CLI. 연결(CFS)·별도(OFS) 각각 조회해 저장. 구현 노트:
    - 손익/현금흐름 항목의 분기 이중 열(당기 3개월 vs 누적)은 `thstrm_amount`/`thstrm_add_amount` 두 필드를 `period_qualifier`로 구분해 별도 행으로 저장
    - `account_id`가 `-표준계정코드 미사용-`이면 `concept=None`으로 저장 (라벨만 있는 계정)
    - 자본변동표(SCE)는 12개 표준 섹션에 대응이 없어 저장 대상에서 제외
    - 멱등성은 다른 단계와 동일하게 delete-then-insert (재실행 시 해당 rcept_no의 metrics를 지우고 다시 채움) — `dart_pipeline/db.py: delete_metrics/insert_metrics`, `darfin_dev`(로컬 개발 DB)에서 오프라인 단위 검증(변환 로직 + 재실행 시 행 수 불변) 완료
    - **미검증**: 이 환경(사용자 Mac)에서 `opendart.fss.or.kr` 자체가 네트워크 단에서 커넥션 리셋되는 문제로 실제 API 라이브 호출은 아직 못 함 (다른 기기/네트워크에선 정상 접속됨 — 이 Mac 특정 문제로 보임). 네트워크 이슈 해소 후 `python scripts/fetch_metrics.py --stock 000660` 로 라이브 검증 필요
-3. 수치 + 해시 기반 diff 엔진 → 공시 변경 탭의 수치형 섹션
+3. 수치 + 해시 기반 diff 엔진 → 공시 변경 탭의 수치형 섹션 ✅ **완료 (재무 수치형은 metrics 적재 후 자동 활성화)** — `dart_pipeline/diff.py`(순수 비교 로직) + `diff_ingest.py`(오케스트레이션) + `scripts/diff_filings.py` CLI. 완전히 오프라인 동작(파싱된 text_chunks/metrics만 사용). 검증: 삼성전자 13건(baseline 있는 전체) diff → `section_diffs` 425행, `pipeline_status` DIFFED, 멱등(재실행 skip / `--force` 동일 결과). baseline 결정이 comparison.js 의미론과 일치함을 확인(1분기 QoQ→전년 사업보고서, 사업보고서 QoQ→3분기, YoY→전년 동유형; 2022는 사업보고서만 있어 2023년 공시들의 YoY 없음 — 정상). 구현 노트:
+   - **분석 유형별 구현**: text/text_numeric/structural/event = content_hash 게이트 → 문단 단위 difflib으로 변경 구간 격리(표만 바뀐 주석 노트는 스킵 — 수치 churn 노이즈 방지), 하위섹션 추가/소멸 감지(1차 AASSOCNOTE+연결/별도 구분 키, 2차 번호 접두사 키로 제목만 바뀐 섹션을 modified로 승격). structural은 표 행 라벨 집합 비교 추가(계열회사 목록의 신규/제외 감지). headcount/ownership = tables_json에서 행 시그니처 기반 추출(colspan 정보가 저장되지 않아 열 위치 특정 불가 → 직원 합계는 소수점 셀(평균근속연수) 직전 정수, 지분율은 행의 마지막 소수점 수치 — 삼성전자 전 연도에서 실제 공시값과 일치 확인: DS 남 직원 53,520/미등기임원 1,015/삼성생명 지분율 8.51→8.41 등)
+   - **분기 유량 vs 연간 유량 가드**: 손익/현금흐름은 기간 버킷(3M/누적)이 양쪽에서 같은 의미일 때만 비교 — reprt_code에 따라 period_qualifier NULL의 의미가 다름(1분기=3개월이자 누적, 사업=연간). 1분기 QoQ(baseline=사업보고서)는 재무상태표만 비교되고 손익/현금흐름은 비교 불가로 비움(합성 metrics로 4개 시나리오 단위 검증). 재무 수치는 핵심 계정 화이트리스트(BS 5·IS 4·CF 3, concept 우선 + account_nm 폴백)
+   - **구조 개편 접기(collapse) 가드**: 한 표준 섹션 그룹에서 하위섹션 10개 이상·50% 이상이 미매칭이면 실제 공시 변경이 아니라 파서 분할 단위 차이(2023↔2024 XML 형식 전환에서 주석 63건씩 발생)로 보고 요약 엔트리 1개로 접음 — 전환 경계 노이즈 337건 → 실제 신규 51건으로 감소. 정상 상태(2025→2026) 연도 쌍은 5~9건 수준으로 유지
+   - **저장 정책**: "변경 없음"은 저장 안 함 — 프론트 `groupDiffsBySection()`이 빈 (섹션, 기준) 쌍도 렌더링하므로 diff 행은 실제 변경만. before/after는 6,000자 클립(TEXT 컬럼·LLM 입력 예산)
+   - **알려진 한계**: ①재무 수치형(numeric) 엔트리는 metrics 테이블이 비어 있어 아직 0건 — 2번의 라이브 검증(fetch_metrics) 후 `--force` 재실행하면 자동으로 채워짐. ②텍스트 섹션의 표만 바뀐 변경(부문별 매출 표 등)은 문단 diff 필터에 걸러짐 — LLM 단계에서 표 diff가 필요해지면 보완. ③structural modified가 분기마다 반복되는 기준일 문자열 변경("기준일: 2026년 3월 31일")도 포착 — 중요도 판단은 4번 LLM 단계의 몫
 4. LLM 단계 (기존 `main.py`의 Gemini 스텁을 raw-text 엔드포인트에서 구조화된 diff 단위 호출로 확장) → 서술형 diff, findings, insights, scores
 5. DART 폴링 스케줄러 + 파이프라인 상태 머신; Spring 조회 엔드포인트; 프론트 목데이터 교체
 
