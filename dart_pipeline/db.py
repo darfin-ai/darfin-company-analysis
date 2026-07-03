@@ -251,3 +251,83 @@ def mark_diffed(conn, rcept_no: str) -> None:
             "UPDATE filings SET pipeline_status = 'DIFFED', error_message = NULL WHERE rcept_no = %s",
             (rcept_no,),
         )
+
+
+# 요약 대상: LLM이 실제로 손댈 필요가 있는 서술형 분석 유형만
+# (numeric/headcount/ownership은 이미 구조화된 metrics만 있고 before/after 텍스트가 없음)
+_NARRATIVE_ANALYSIS_TYPES = ("text", "text_numeric", "structural", "event")
+
+
+def filings_for_summarizing(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """LLM 요약 대상 filings. 기본은 DIFFED 상태만, force=True면 SUMMARIZED도 재처리."""
+    target_statuses = ("DIFFED", "SUMMARIZED") if force else ("DIFFED",)
+    placeholders = ",".join(["%s"] * len(target_statuses))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT rcept_no, corp_code, bsns_year, reprt_code
+            FROM filings
+            WHERE corp_code = %s AND pipeline_status IN ({placeholders})
+            ORDER BY bsns_year, reprt_code
+            """,
+            (corp_code, *target_statuses),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def narrative_diffs_for_filing(conn, rcept_no: str) -> list[dict]:
+    """LLM 폴리싱 대상 section_diffs 행 (서술형 + before/after 중 하나 이상 존재)."""
+    placeholders = ",".join(["%s"] * len(_NARRATIVE_ANALYSIS_TYPES))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, canonical_label, comparison_type, analysis_type, change_type,
+                   before_text, after_text, source_label, source_ref
+            FROM section_diffs
+            WHERE rcept_no = %s AND analysis_type IN ({placeholders})
+              AND (before_text IS NOT NULL OR after_text IS NOT NULL)
+            """,
+            (rcept_no, *_NARRATIVE_ANALYSIS_TYPES),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def update_section_diff_text(conn, diff_id: int, before_text: str | None, after_text: str | None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE section_diffs SET before_text = %s, after_text = %s WHERE id = %s",
+            (before_text, after_text, diff_id),
+        )
+
+
+def delete_llm_summaries(conn, rcept_no: str) -> None:
+    """재실행 멱등성: 새로 채우기 전에 해당 공시의 기존 llm_summaries를 지운다."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM llm_summaries WHERE rcept_no = %s", (rcept_no,))
+
+
+def insert_llm_summaries(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO llm_summaries
+              (rcept_no, corp_code, summary_type, content, source_refs,
+               model_used, tokens_in, tokens_out, cost_usd, latency_ms)
+            VALUES (%(rcept_no)s, %(corp_code)s, %(summary_type)s, %(content)s, %(source_refs)s,
+                    %(model_used)s, %(tokens_in)s, %(tokens_out)s, %(cost_usd)s, %(latency_ms)s)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def mark_summarized(conn, rcept_no: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE filings SET pipeline_status = 'SUMMARIZED', error_message = NULL WHERE rcept_no = %s",
+            (rcept_no,),
+        )
