@@ -62,3 +62,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# ingest pipeline artifacts
+data/

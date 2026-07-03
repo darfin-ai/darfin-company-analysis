@@ -23,6 +23,22 @@ _BARE_AMP = re.compile(r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)")
 
 _DOC_END = "</DOCUMENT>"
 
+_DECL_ENCODING = re.compile(rb'encoding\s*=\s*["\']([A-Za-z0-9._-]+)["\']')
+
+
+def _sniff_encoding(raw: bytes) -> str:
+    """XML 선언에서 인코딩을 읽는다. 픽스처는 UTF-8이지만 DART API로 받은
+    구형 문서는 EUC-KR일 수 있다. 선언이 없으면 UTF-8로 가정."""
+    if raw[:3] == b"\xef\xbb\xbf":
+        return "utf-8"
+    m = _DECL_ENCODING.search(raw[:200])
+    if not m:
+        return "utf-8"
+    name = m.group(1).decode().lower()
+    if name in ("euc-kr", "ks_c_5601-1987", "ksc5601"):
+        return "cp949"  # EUC-KR의 상위집합 — 확장 한글까지 안전
+    return name
+
 
 def load_document(path: str | Path) -> tuple[etree._Element, list[str]]:
     """DART XML 파일 하나를 (루트 엘리먼트, 경고 목록)으로 로드한다."""
@@ -30,9 +46,12 @@ def load_document(path: str | Path) -> tuple[etree._Element, list[str]]:
     warnings: list[str] = []
 
     raw = path.read_bytes()
-    text = raw.decode("utf-8", errors="replace")
+    encoding = _sniff_encoding(raw)
+    text = raw.decode(encoding, errors="replace")
+    if encoding != "utf-8":
+        warnings.append(f"non-UTF-8 encoding: {encoding}")
     if "�" in text:
-        warnings.append(f"invalid UTF-8 bytes replaced: {text.count(chr(0xFFFD))}")
+        warnings.append(f"invalid {encoding} bytes replaced: {text.count(chr(0xFFFD))}")
 
     # 1. 문서 종료 태그 이후의 잔여물 제거
     end = text.find(_DOC_END)

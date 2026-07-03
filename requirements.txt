@@ -4,3 +4,5 @@ google-genai==1.28.0
 pydantic==2.10.4
 python-dotenv==1.0.1
 lxml==5.3.0
+requests==2.32.3
+pymysql==1.1.1

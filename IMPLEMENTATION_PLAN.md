@@ -110,6 +110,13 @@ DART Open API ──▶ [darfin-company-analysis (Python/FastAPI)]          [dar
    - **재무제표 인코딩이 연도마다 다름 (3가지 형식)**: ①2023 = 캡션 표 + 본문 표 쌍(TITLE 없음, ACODE 없음) → 캡션 표에서 가상 섹션 합성 + 라벨 기반 수치 추출, ②2024 = TITLE 있는 TABLE-GROUP이지만 ACODE 없음 → 라벨 기반 추출, ③2025~2026 = TE 셀에 ACODE/ACONTEXT/ADECIMAL 완비 → concept 기반 추출
    - **ATOCID는 2023 파일에 없음** → 앵커는 AASSOCNOTE > breadcrumb 순으로 사용 (계획대로)
    - **ACONTEXT 접두사(C/P)로 당기/전기 판별** 가능, 라벨 기반일 때는 머리글의 제N기 번호로 판별
+1-b. **수집 파이프라인 (Stage 1)** ✅ **완료** — `dart_pipeline/` 패키지(client / corp_codes / db / ingest) + `scripts/ingest_filings.py` CLI. 검증: 삼성전자 2023~2026 정기공시 14건(사업 4·반기 3·분기 7)을 라이브 API로 수집, MariaDB `filings` 기록(RAW), 전 건 파싱 스모크 12/12 통과, 재실행 시 전 건 skip(멱등). 구현 노트:
+   - 발견은 `list.json` + `pblntf_ty=A` + `last_reprt_at=Y`(정정공시는 최종본만), `reprt_code`/`bsns_year`는 `report_nm`의 "(YYYY.MM)"에서 추론
+   - 문서 zip에서 본문 XML 선택: `{rcept_no}.xml` 우선, 없으면 최대 크기 `.xml`
+   - 공시 1건 = 커밋 1건 (중단돼도 완료분 보존), 한 건 실패가 배치를 막지 않음
+   - `dart_parser/loader.py`에 인코딩 스니핑 추가 (구형 문서 EUC-KR 대비)
+   - corpCode.xml은 `data/corp_codes.zip`에 24시간 캐시
+   - **미구현(5번에서)**: 일일 폴링 스케줄러
 2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과)
 3. 수치 + 해시 기반 diff 엔진 → 공시 변경 탭의 수치형 섹션
 4. LLM 단계 (기존 `main.py`의 Gemini 스텁을 raw-text 엔드포인트에서 구조화된 diff 단위 호출로 확장) → 서술형 diff, findings, insights, scores
