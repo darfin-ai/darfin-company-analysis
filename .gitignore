@@ -65,3 +65,6 @@ venv/
 
 # ingest pipeline artifacts
 data/
+
+# 로컬 env 백업 (실제 자격증명 포함 — 절대 커밋 금지)
+.env.*.bak

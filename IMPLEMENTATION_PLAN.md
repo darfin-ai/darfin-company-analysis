@@ -107,9 +107,11 @@ DART Open API ──▶ [darfin-company-analysis (Python/FastAPI)]          [dar
    - **파일이 well-formed XML이 아님**: `</DOCUMENT>` 뒤 중복 잔여물(최대 1.3MB), 이스케이프 안 된 `&`(파일당 수백 개), 깨진 UTF-8 바이트 → `loader.py`가 절단·치환 후 lxml recover 모드로 파싱, 전 과정 warnings로 기록
    - **섹션 분할 단위는 SECTION 컨테이너가 아니라 TITLE**: 한 컨테이너에 TITLE 여러 개 (두 번째부터는 가상 하위 섹션)
    - **LIBRARY는 투명 래퍼**: 사업의 내용 하위 섹션·재무제표가 그 아래에 숨어 있음
-   - **재무제표 인코딩이 연도마다 다름 (3가지 형식)**: ①2023 = 캡션 표 + 본문 표 쌍(TITLE 없음, ACODE 없음) → 캡션 표에서 가상 섹션 합성 + 라벨 기반 수치 추출, ②2024 = TITLE 있는 TABLE-GROUP이지만 ACODE 없음 → 라벨 기반 추출, ③2025~2026 = TE 셀에 ACODE/ACONTEXT/ADECIMAL 완비 → concept 기반 추출
+   - **재무제표 인코딩이 연도마다 다름 (4가지 형식 확인됨)**: ①2023(사업/반기/1분기) = 캡션 표 + 본문 표 쌍(TITLE 없음, ACODE 없음) → 캡션 표에서 가상 섹션 합성 + 라벨 기반 수치 추출, ②2024(+2023 3분기) = TITLE 있는 TABLE-GROUP이지만 ACODE 없음 → 라벨 기반 추출, ③2025~2026 = TE 셀에 ACODE/ACONTEXT/ADECIMAL 완비 → concept 기반 추출, ④2023 3분기(`20231114002109`)만 별도 = TITLE 있는 TABLE-GROUP + ACODE는 있으나 `concept|context|decimal|unit|` 형태로 한 속성에 압축(ACONTEXT/ADECIMAL 속성 자체가 없음) → `dart_parser/tables.py: parse_cell()`에서 `|` 포함 시 분해해 보정 (검증: `scripts/validate_fixtures.py` 스팟체크 3종 전부 실제 공시값과 일치)
+   - **라벨 기반 추출 시 행 라벨이 연도마다 다를 수 있음**: 매출액 행이 보통 "매출액"/"수익(매출액)"이지만 `20240312000736`(2024.03 사업보고서, FY2023)은 같은 회사·같은 개념인데 "영업수익"으로 표기 — 스팟체크 정규식에 별칭으로 추가함(`scripts/validate_fixtures.py`). 라벨 기반 추출에 의존하는 한 이런 표기 편차가 더 나올 수 있음.
    - **ATOCID는 2023 파일에 없음** → 앵커는 AASSOCNOTE > breadcrumb 순으로 사용 (계획대로)
    - **ACONTEXT 접두사(C/P)로 당기/전기 판별** 가능, 라벨 기반일 때는 머리글의 제N기 번호로 판별
+   - **미확인**: 위 ④(압축 ACODE)와 "영업수익" 라벨 편차가 삼성전자 2023 3분기 한정인지, 아니면 그 분기에 DART 시스템 전반의 인코딩이 바뀌어 다른 회사에도 나타나는지 아직 모름 — 현재 픽스처가 삼성전자 1개사뿐이라 회사별 차이와 분기별 차이를 구분할 수 없음. **다음 회사 확장(SK하이닉스 등) 때 확인할 것**: SK하이닉스 등 3~4개사의 2023 3분기(및 인접 분기) 공시를 받아 동일한 파이프 압축 ACODE·"영업수익" 라벨이 나타나는지 대조 — 나타나면 시기(그 분기의 DART 시스템 변경) 문제, 특정 회사에서만 나타나면 회사별 편차 문제로 파서 대응 방식이 달라짐(전자는 시기별 조건 분기, 후자는 라벨/포맷 감지를 더 일반화해야 함)
 1-b. **수집 파이프라인 (Stage 1)** ✅ **완료** — `dart_pipeline/` 패키지(client / corp_codes / db / ingest) + `scripts/ingest_filings.py` CLI. 검증: 삼성전자 2023~2026 정기공시 14건(사업 4·반기 3·분기 7)을 라이브 API로 수집, MariaDB `filings` 기록(RAW), 전 건 파싱 스모크 12/12 통과, 재실행 시 전 건 skip(멱등). 구현 노트:
    - 발견은 `list.json` + `pblntf_ty=A` + `last_reprt_at=Y`(정정공시는 최종본만), `reprt_code`/`bsns_year`는 `report_nm`의 "(YYYY.MM)"에서 추론
    - 문서 zip에서 본문 XML 선택: `{rcept_no}.xml` 우선, 없으면 최대 크기 `.xml`

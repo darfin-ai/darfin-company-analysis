@@ -53,7 +53,20 @@ def scaled_value(text: str, adecimal: int | None, anegated: bool) -> int | float
 
 def parse_cell(el: etree._Element) -> Cell:
     acode = el.get("ACODE")
+    acontext = el.get("ACONTEXT")
     adecimal_raw = el.get("ADECIMAL")
+
+    # 일부 파일(2023 3분기보고서 등)은 ACONTEXT/ADECIMAL을 별도 속성으로
+    # 두지 않고 ACODE 하나에 "concept|context|decimal|unit|" 형태로 압축한다.
+    if acode and "|" in acode:
+        concept, _, rest = acode.partition("|")
+        parts = rest.split("|")
+        acode = concept or None
+        if acontext is None:
+            acontext = parts[0] or None if len(parts) > 0 else None
+        if adecimal_raw is None:
+            adecimal_raw = parts[1] or None if len(parts) > 1 else None
+
     adecimal = int(adecimal_raw) if adecimal_raw and adecimal_raw.lstrip("-").isdigit() else None
     anegated = el.get("ANEGATED") == "Y"
     text = cell_text(el)
@@ -66,7 +79,7 @@ def parse_cell(el: etree._Element) -> Cell:
         text=text,
         tag=el.tag,
         acode=acode,
-        acontext=el.get("ACONTEXT"),
+        acontext=acontext,
         adecimal=adecimal,
         anegated=anegated,
         value=value,

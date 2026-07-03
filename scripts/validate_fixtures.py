@@ -29,7 +29,9 @@ import re
 # "법인세비용차감전순이익" 같은 다른 행에 오매칭된다.
 SPOT_CHECKS = [
     ("유동자산", "재무상태표", "ifrs-full_CurrentAssets", r"^유동자산"),
-    ("매출액", "손익계산서", "ifrs-full_Revenue", r"^(수익\(매출액\)|매출액)"),
+    # "영업수익"은 2024.03 사업보고서(FY2023)에서 매출액 대신 쓰인 행 라벨.
+    # 같은 회사가 분기보고서에서는 "매출액"을 쓰므로 별칭으로 함께 인정한다.
+    ("매출액", "손익계산서", "ifrs-full_Revenue", r"^(수익\(매출액\)|매출액|영업수익)"),
     ("순이익", "손익계산서", "ifrs-full_ProfitLoss", r"^(당기|분기|반기)?순이익"),
 ]
 
@@ -115,8 +117,9 @@ def main() -> int:
 
     # 매출 시계열 (diff/재무추이 탭의 원천이 되는 값)
     print(f"\n연도별 매출액(연결, 당기) 시계열:")
+    revenue_label = next(label for _, _, concept, label in SPOT_CHECKS if concept == "ifrs-full_Revenue")
     for name in names:
-        fact = find_fact(filings[name], "손익계산서", "ifrs-full_Revenue", "매출액")
+        fact = find_fact(filings[name], "손익계산서", "ifrs-full_Revenue", revenue_label)
         print(f"  {name[:20]}: {krw(fact.value) if fact else 'N/A'}")
 
     print(f"\n{'검증 실패 항목 있음 ✗' if failed else '전체 검증 통과 ✓'}")
