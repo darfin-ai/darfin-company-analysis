@@ -331,3 +331,116 @@ def mark_summarized(conn, rcept_no: str) -> None:
             "UPDATE filings SET pipeline_status = 'SUMMARIZED', error_message = NULL WHERE rcept_no = %s",
             (rcept_no,),
         )
+
+
+def filings_for_findings(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """findings 추출 대상 filings. 기본은 아직 findings가 없는 DIFFED/SUMMARIZED만,
+    force=True면 상태 무관하게 전체 재처리(기존 findings/score_history를 지우고 재생성)."""
+    if force:
+        query = """
+            SELECT rcept_no, corp_code, bsns_year, reprt_code
+            FROM filings
+            WHERE corp_code = %s AND pipeline_status IN ('DIFFED', 'SUMMARIZED')
+            ORDER BY bsns_year, reprt_code
+        """
+    else:
+        query = """
+            SELECT f.rcept_no, f.corp_code, f.bsns_year, f.reprt_code
+            FROM filings f
+            LEFT JOIN findings fd ON fd.rcept_no = f.rcept_no
+            WHERE f.corp_code = %s AND f.pipeline_status IN ('DIFFED', 'SUMMARIZED')
+            GROUP BY f.rcept_no, f.corp_code, f.bsns_year, f.reprt_code
+            HAVING COUNT(fd.id) = 0
+            ORDER BY f.bsns_year, f.reprt_code
+        """
+    with conn.cursor() as cur:
+        cur.execute(query, (corp_code,))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def all_diffs_for_filing(conn, rcept_no: str, comparison_type: str = "QoQ") -> list[dict]:
+    """findings 증거 카탈로그 입력: analysis_type 무관 전체 section_diffs 행.
+
+    numeric(재무상태표/손익계산서/현금흐름표)까지 포함해야 financial_anomaly
+    hop을 만들 수 있다 — narrative_diffs_for_filing과 달리 필터링하지 않는다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, canonical_label, analysis_type, change_type,
+                   before_text, after_text, metrics_json, source_label, source_ref
+            FROM section_diffs
+            WHERE rcept_no = %s AND comparison_type = %s
+            """,
+            (rcept_no, comparison_type),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def mdna_chunk_for_filing(conn, rcept_no: str) -> dict | None:
+    """이사의 경영진단 및 분석의견(MD&A) 텍스트 청크 1건.
+
+    12개 표준 섹션에 없어(canonical_label NULL) section_diffs로 잡히지 않으므로
+    text_chunks에서 제목으로 직접 조회한다. 여러 하위 청크로 쪼개졌을 수 있어
+    가장 긴 것을 대표로 쓴다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT section_title, breadcrumb, content
+            FROM text_chunks
+            WHERE rcept_no = %s AND section_title LIKE '%%경영진단%%'
+            ORDER BY CHAR_LENGTH(content) DESC
+            LIMIT 1
+            """,
+            (rcept_no,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def delete_findings(conn, rcept_no: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM findings WHERE rcept_no = %s", (rcept_no,))
+
+
+def insert_findings(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO findings
+              (rcept_no, corp_code, severity, score_component, summary, hops_json)
+            VALUES (%(rcept_no)s, %(corp_code)s, %(severity)s, %(score_component)s,
+                    %(summary)s, %(hops_json)s)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def delete_score_history(conn, rcept_no: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM score_history WHERE rcept_no = %s", (rcept_no,))
+
+
+def insert_score_history(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO score_history
+              (corp_code, rcept_no, quarter, component, value, max_points)
+            VALUES (%(corp_code)s, %(rcept_no)s, %(quarter)s, %(component)s,
+                    %(value)s, %(max_points)s)
+            """,
+            rows,
+        )
+    return len(rows)
