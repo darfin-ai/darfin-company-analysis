@@ -74,3 +74,43 @@ def mark_failed(conn, rcept_no: str, error_message: str) -> None:
             "UPDATE filings SET pipeline_status = 'FAILED', error_message = %s WHERE rcept_no = %s",
             (error_message[:300], rcept_no),
         )
+
+
+def filings_missing_metrics(conn, corp_code: str) -> list[dict]:
+    """metrics가 아직 없는 해당 기업의 filings (rcept_no/bsns_year/reprt_code)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.rcept_no, f.bsns_year, f.reprt_code
+            FROM filings f
+            LEFT JOIN metrics m ON m.rcept_no = f.rcept_no
+            WHERE f.corp_code = %s AND m.id IS NULL AND f.pipeline_status != 'FAILED'
+            """,
+            (corp_code,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def delete_metrics(conn, rcept_no: str) -> None:
+    """재실행 멱등성: 새로 채우기 전에 해당 공시의 기존 metrics를 지운다."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM metrics WHERE rcept_no = %s", (rcept_no,))
+
+
+def insert_metrics(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO metrics
+              (rcept_no, corp_code, bsns_year, reprt_code, concept, account_nm,
+               statement_type, is_consolidated, period_qualifier, amount)
+            VALUES (%(rcept_no)s, %(corp_code)s, %(bsns_year)s, %(reprt_code)s,
+                    %(concept)s, %(account_nm)s, %(statement_type)s,
+                    %(is_consolidated)s, %(period_qualifier)s, %(amount)s)
+            """,
+            rows,
+        )
+    return len(rows)

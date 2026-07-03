@@ -120,6 +120,29 @@ class DartClient:
         """전체 기업 고유번호 파일 (zip 안에 CORPCODE.xml)."""
         return self._get_zip("corpCode.xml")
 
+    def fnltt_singl_acnt_all(
+        self, corp_code: str, bsns_year: str, reprt_code: str, fs_div: str
+    ) -> list[dict]:
+        """단일회사 전체 재무제표. fs_div: CFS(연결) / OFS(별도).
+
+        XML 테이블 파싱과 달리 IFRS concept(account_id)과 당기/전기 금액이
+        이미 구조화되어 있다 (IMPLEMENTATION_PLAN.md §5 구현 순서 2).
+        """
+        data = self._get(
+            "fnlttSinglAcntAll.json",
+            corp_code=corp_code,
+            bsns_year=bsns_year,
+            reprt_code=reprt_code,
+            fs_div=fs_div,
+        ).json()
+
+        status = data.get("status")
+        if status == _NO_DATA:
+            return []
+        if status != "000":
+            raise DartApiError(status, data.get("message", _STATUS_MESSAGES.get(status, "")))
+        return data.get("list", [])
+
     def document_zip(self, rcept_no: str) -> bytes:
         """공시 원본 파일 (zip 안에 본문 XML)."""
         return self._get_zip("document.xml", rcept_no=rcept_no)

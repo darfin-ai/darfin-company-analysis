@@ -119,7 +119,12 @@ DART Open API ──▶ [darfin-company-analysis (Python/FastAPI)]          [dar
    - `dart_parser/loader.py`에 인코딩 스니핑 추가 (구형 문서 EUC-KR 대비)
    - corpCode.xml은 `data/corp_codes.zip`에 24시간 캐시
    - **미구현(5번에서)**: 일일 폴링 스케줄러
-2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과)
+2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과) ✅ **코드 완료, 라이브 검증 대기** — `dart_pipeline/metrics.py`(순수 변환, XML 무관) + `metrics_ingest.py`(오케스트레이션) + `scripts/fetch_metrics.py` CLI. 연결(CFS)·별도(OFS) 각각 조회해 저장. 구현 노트:
+   - 손익/현금흐름 항목의 분기 이중 열(당기 3개월 vs 누적)은 `thstrm_amount`/`thstrm_add_amount` 두 필드를 `period_qualifier`로 구분해 별도 행으로 저장
+   - `account_id`가 `-표준계정코드 미사용-`이면 `concept=None`으로 저장 (라벨만 있는 계정)
+   - 자본변동표(SCE)는 12개 표준 섹션에 대응이 없어 저장 대상에서 제외
+   - 멱등성은 다른 단계와 동일하게 delete-then-insert (재실행 시 해당 rcept_no의 metrics를 지우고 다시 채움) — `dart_pipeline/db.py: delete_metrics/insert_metrics`, `darfin_dev`(로컬 개발 DB)에서 오프라인 단위 검증(변환 로직 + 재실행 시 행 수 불변) 완료
+   - **미검증**: 이 환경(사용자 Mac)에서 `opendart.fss.or.kr` 자체가 네트워크 단에서 커넥션 리셋되는 문제로 실제 API 라이브 호출은 아직 못 함 (다른 기기/네트워크에선 정상 접속됨 — 이 Mac 특정 문제로 보임). 네트워크 이슈 해소 후 `python scripts/fetch_metrics.py --stock 000660` 로 라이브 검증 필요
 3. 수치 + 해시 기반 diff 엔진 → 공시 변경 탭의 수치형 섹션
 4. LLM 단계 (기존 `main.py`의 Gemini 스텁을 raw-text 엔드포인트에서 구조화된 diff 단위 호출로 확장) → 서술형 diff, findings, insights, scores
 5. DART 폴링 스케줄러 + 파이프라인 상태 머신; Spring 조회 엔드포인트; 프론트 목데이터 교체
