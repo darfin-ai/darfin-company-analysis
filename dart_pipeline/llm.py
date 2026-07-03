@@ -4,13 +4,17 @@
 보지 않는다. 이미 diff 엔진이 문단 단위로 격리해 둔 변경 구간(before/after)과
 그 섹션 라벨만 입력한다.
 
-findings 추출도 같은 원칙: sectionLabel/excerpt/sourceRef는 전부 DB 원본 행에서
-코드가 기계적으로 채우고(모델 신뢰 X), 모델은 (1) 어떤 증거를 하나의 finding으로
-묶을지, (2) severity/scoreComponent, (3) summary 헤드라인만 결정한다.
+findings/risks 추출도 같은 원칙: sectionLabel/excerpt/sourceRef는 전부 DB 원본
+행(또는 문단 단위로 쪼갠 청크)에서 코드가 기계적으로 채우고(모델 신뢰 X), 모델은
+(1) 어떤 증거를 하나로 묶을지, (2) severity/scoreComponent(or title/description),
+(3) summary/insight 텍스트만 결정한다.
 
-company_overview/strategyShifts 등 Stage 4의 나머지 산출물은 다루지 않는다 —
-DART XML에서 아직 구조화되지 않은 값(고객 비중, 지역별 매출 등)을 새로 파싱해야
-하는 별도 작업이라 범위 밖.
+company_overview의 segments/products/regions/shareholders/dividend는 이 모듈이
+아니라 overview.py가 tables_json에서 결정론적으로 뽑는다(LLM 불필요) — 이
+모듈은 그 결과에 대한 `*Insight` 한 줄(generate_panel_insights)과, 프로즈만
+있어 결정론적으로 뽑을 수 없는 risks 패널(extract_risks)만 담당한다.
+
+strategyShifts는 범위 밖(별도 라운드).
 """
 
 from __future__ import annotations
@@ -265,3 +269,154 @@ def extract_findings(client: genai.Client, evidence: list[EvidenceItem]) -> list
             )
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# risks 추출 (company_overview 일부)
+# ---------------------------------------------------------------------------
+
+_RISKS_SYSTEM_INSTRUCTION = (
+    "당신은 기업 공시의 위험요인 서술을 투자자가 읽기 좋은 핵심 리스크 항목으로 "
+    "정리하는 보조 도구입니다. 입력은 번호(evidence_id)가 매겨진 문단 배열이며, "
+    "각 문단은 공시의 위험관리 관련 서술을 그대로 잘라낸 것입니다.\n"
+    "이 중 투자자에게 의미 있는 핵심 리스크를 최대 5개까지 뽑아 각각:\n"
+    "- evidence_ids: 근거로 삼은 문단 evidence_id 목록 (입력에 실제로 존재하는 값, 1개 이상)\n"
+    "- title: 리스크를 짧게 요약한 제목 (10자 내외)\n"
+    "- description: 리스크 내용을 설명하는 한국어 1~2문장\n"
+    "- severity: high/medium/low 중 하나\n"
+    "규칙:\n"
+    "1. 입력에 없는 사실·수치·추측을 절대 추가하지 마세요.\n"
+    "2. evidence_ids는 입력에 주어진 값만 사용하세요.\n"
+    "3. 형식적이거나 모든 기업에 공통되는 상투적 서술(예: 일반적인 환율 변동 언급)보다는 "
+    "이 공시에 특정된 내용을 우선하세요."
+)
+
+
+class _RiskCandidate(BaseModel):
+    evidence_ids: list[int]
+    title: str
+    description: str
+    severity: _Severity
+
+
+class _RiskBatch(BaseModel):
+    risks: list[_RiskCandidate]
+
+
+@dataclass
+class RiskCandidate:
+    evidence_ids: list[int]
+    title: str
+    description: str
+    severity: str
+
+
+def extract_risks(client: genai.Client, evidence: list[EvidenceItem]) -> list[RiskCandidate]:
+    """위험요인 청크를 문단 단위로 쪼갠 evidence에서 핵심 리스크를 뽑는다.
+
+    extract_findings와 동일한 검증 원칙: evidence_ids가 카탈로그에 없으면
+    걸러내고, 다 걸러지면 해당 리스크는 버린다.
+    """
+    if not evidence:
+        return []
+
+    valid_ids = {item.evidence_id for item in evidence}
+    contents = "\n\n---\n\n".join(_evidence_prompt(item) for item in evidence)
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=_RISKS_SYSTEM_INSTRUCTION,
+            temperature=0.2,
+            response_mime_type="application/json",
+            response_schema=_RiskBatch,
+        ),
+    )
+
+    parsed: _RiskBatch | None = response.parsed
+    if parsed is None:
+        raise RuntimeError(
+            f"Gemini 응답이 스키마로 파싱되지 않음 (finish_reason="
+            f"{response.candidates[0].finish_reason if response.candidates else '?'}) — "
+            f"evidence={len(evidence)}건"
+        )
+
+    results: list[RiskCandidate] = []
+    for candidate in parsed.risks:
+        kept_ids = [eid for eid in candidate.evidence_ids if eid in valid_ids]
+        if not kept_ids:
+            continue
+        results.append(
+            RiskCandidate(
+                evidence_ids=kept_ids,
+                title=candidate.title,
+                description=candidate.description,
+                severity=candidate.severity,
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 패널 insight 생성 (company_overview 일부)
+# ---------------------------------------------------------------------------
+
+_INSIGHT_SYSTEM_INSTRUCTION = (
+    "당신은 기업 공시의 수치 요약을 읽고 투자자에게 의미를 짚어주는 보조 도구입니다. "
+    "입력은 여러 개의 패널 요약(panel_key + 수치 사실)으로 구성된 배열이며, 각 "
+    "요약은 이미 공시에서 기계적으로 뽑아낸 사실입니다. 각 패널에 대해 'So "
+    "what?'에 해당하는 한국어 1~2문장 해설을 쓰고, 입력과 동일한 개수·순서로 "
+    "결과 배열을 반환하세요.\n"
+    "규칙:\n"
+    "1. 입력에 없는 사실·수치를 절대 추가하지 마세요.\n"
+    "2. 각 항목의 index는 입력에 주어진 값을 그대로 돌려주세요."
+)
+
+
+class _PanelInsight(BaseModel):
+    index: int
+    insight: str
+
+
+class _PanelInsightBatch(BaseModel):
+    results: list[_PanelInsight]
+
+
+@dataclass
+class PanelFact:
+    panel_key: str
+    fact_summary: str
+
+
+def _panel_prompt(index: int, fact: PanelFact) -> str:
+    return f"index: {index}\n패널: {fact.panel_key}\n수치 사실: {fact.fact_summary}"
+
+
+def generate_panel_insights(client: genai.Client, panels: list[PanelFact]) -> list[str]:
+    """여러 패널의 결정론적 수치 요약을 한 번에 보내 'So what?' 한 줄씩 받는다."""
+    if not panels:
+        return []
+
+    contents = "\n\n---\n\n".join(_panel_prompt(i, p) for i, p in enumerate(panels))
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=_INSIGHT_SYSTEM_INSTRUCTION,
+            temperature=0.3,
+            response_mime_type="application/json",
+            response_schema=_PanelInsightBatch,
+        ),
+    )
+
+    parsed: _PanelInsightBatch | None = response.parsed
+    if parsed is None:
+        raise RuntimeError(
+            f"Gemini 응답이 스키마로 파싱되지 않음 (finish_reason="
+            f"{response.candidates[0].finish_reason if response.candidates else '?'}) — "
+            f"panels={len(panels)}건"
+        )
+    by_index = {item.index: item.insight for item in parsed.results}
+    return [by_index.get(i, "") for i in range(len(panels))]

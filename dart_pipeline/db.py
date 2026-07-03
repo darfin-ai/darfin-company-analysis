@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 
 import pymysql
@@ -444,3 +445,87 @@ def insert_score_history(conn, rows: list[dict]) -> int:
             rows,
         )
     return len(rows)
+
+
+def filings_for_overview(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """company_overview 대상 filings. baseline(직전 filing) 체이닝에 전체
+    이력이 필요하므로(diff.py의 filings_for_diffing과 같은 이유) 전체를 반환하고
+    is_target 플래그로 실제 처리 대상만 구분한다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.rcept_no, f.corp_code, f.bsns_year, f.reprt_code, f.filed_date,
+                   (co.rcept_no IS NOT NULL) AS has_overview
+            FROM filings f
+            LEFT JOIN company_overview co ON co.rcept_no = f.rcept_no
+            WHERE f.corp_code = %s AND f.pipeline_status != 'FAILED'
+            ORDER BY f.bsns_year, f.filed_date
+            """,
+            (corp_code,),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for r in rows:
+        r["is_target"] = force or not r["has_overview"]
+    return rows
+
+
+def dividend_chunk_for_filing(conn, rcept_no: str) -> dict | None:
+    """배당에 관한 사항 텍스트 청크. 12개 표준 섹션에 없어(canonical_label NULL)
+    MD&A와 동일한 패턴으로 제목 조회한다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT section_title, breadcrumb, content, tables_json
+            FROM text_chunks
+            WHERE rcept_no = %s AND section_title LIKE '%%배당%%'
+            ORDER BY CHAR_LENGTH(content) DESC
+            LIMIT 1
+            """,
+            (rcept_no,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def risk_chunks_for_filing(conn, rcept_no: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT section_title, breadcrumb, content
+            FROM text_chunks
+            WHERE rcept_no = %s AND canonical_label = '위험요인'
+            ORDER BY section_order
+            """,
+            (rcept_no,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def overview_for_filing(conn, rcept_no: str) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT overview_json FROM company_overview WHERE rcept_no = %s", (rcept_no,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+
+def delete_company_overview(conn, rcept_no: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM company_overview WHERE rcept_no = %s", (rcept_no,))
+
+
+def insert_company_overview(conn, row: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO company_overview (rcept_no, corp_code, overview_json, model_used)
+            VALUES (%(rcept_no)s, %(corp_code)s, %(overview_json)s, %(model_used)s)
+            """,
+            row,
+        )
