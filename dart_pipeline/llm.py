@@ -1,19 +1,24 @@
-"""LLM 폴리싱 — 순수 함수 (Stage 4의 첫 조각: 서술형 diff before/after 요약).
+"""LLM 호출 — 순수 함수 모음 (Stage 4: diff 폴리싱 + findings 추출).
 
 비용 통제 원칙(IMPLEMENTATION_PLAN.md §2 Stage 4): 모델은 공시 전문을 절대
 보지 않는다. 이미 diff 엔진이 문단 단위로 격리해 둔 변경 구간(before/after)과
 그 섹션 라벨만 입력한다.
 
-이 모듈은 findings/overview/scores 등 Stage 4의 나머지 산출물은 다루지 않는다
-(각각 별도 추출 설계가 필요한 더 큰 작업) — 여기서는 diff 엔진이 이미 만든
-before/after 원문(diff.py의 문단 단위 격리 결과, 다소 거친 텍스트)을 사람이
-읽기 좋은 요약으로 다듬는 것만 한다.
+findings 추출도 같은 원칙: sectionLabel/excerpt/sourceRef는 전부 DB 원본 행에서
+코드가 기계적으로 채우고(모델 신뢰 X), 모델은 (1) 어떤 증거를 하나의 finding으로
+묶을지, (2) severity/scoreComponent, (3) summary 헤드라인만 결정한다.
+
+company_overview/strategyShifts 등 Stage 4의 나머지 산출물은 다루지 않는다 —
+DART XML에서 아직 구조화되지 않은 값(고객 비중, 지역별 매출 등)을 새로 파싱해야
+하는 별도 작업이라 범위 밖.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+
+from typing import Literal
 
 from google import genai
 from google.genai import types
@@ -104,7 +109,13 @@ def polish_diff_entries(client: genai.Client, entries: list[DiffEntry]) -> list[
     )
     latency_ms = int((time.monotonic() - started) * 1000)
 
-    parsed: _DiffSummaryBatch = response.parsed
+    parsed: _DiffSummaryBatch | None = response.parsed
+    if parsed is None:
+        raise RuntimeError(
+            f"Gemini 응답이 스키마로 파싱되지 않음 (finish_reason="
+            f"{response.candidates[0].finish_reason if response.candidates else '?'}) — "
+            f"entries={len(entries)}건, latency={latency_ms}ms"
+        )
     by_index = {item.index: item for item in parsed.results}
 
     usage = response.usage_metadata
@@ -140,4 +151,117 @@ def polish_diff_entries(client: genai.Client, entries: list[DiffEntry]) -> list[
             )
         )
 
+    return results
+
+
+# ---------------------------------------------------------------------------
+# findings 추출
+# ---------------------------------------------------------------------------
+
+_FINDINGS_SYSTEM_INSTRUCTION = (
+    "당신은 기업 공시의 변경 사항을 분석해 투자자에게 의미 있는 관찰(finding)로 "
+    "묶어내는 보조 도구입니다. 입력은 번호(evidence_id)가 매겨진 증거 항목 배열이며, "
+    "각 항목은 이미 두 공시를 기계적으로 비교하거나 파싱해 뽑아낸 사실입니다.\n"
+    "서로 연관된 증거들을 묶어 최대 5개 이내의 finding으로 정리하세요. 각 finding은:\n"
+    "- evidence_ids: 근거로 삼은 evidence_id 목록 (반드시 입력에 실제로 존재하는 값, 1개 이상)\n"
+    "- severity: high/medium/low 중 하나 (투자자에게 미치는 영향 크기)\n"
+    "- score_component: financialChange(재무 변동)/riskEscalation(위험 확대)/"
+    "managementEmphasis(경영진 강조)/governance(지배구조·공시) 중 가장 적합한 하나\n"
+    "- summary: 이 finding을 설명하는 한국어 1~2문장 헤드라인\n"
+    "규칙:\n"
+    "1. 입력된 증거에 없는 사실·수치·추측을 절대 추가하지 마세요.\n"
+    "2. evidence_ids는 입력에 주어진 evidence_id 값만 사용하세요 — 존재하지 않는 id를 "
+    "만들어내지 마세요.\n"
+    "3. 사소하거나 형식적인 변경(기준일 문자열 갱신 등)은 finding으로 만들지 마세요.\n"
+    "4. 증거가 서로 무관하면 억지로 묶지 말고 각각 별도 finding으로 두세요."
+)
+
+_ScoreComponent = Literal["financialChange", "riskEscalation", "managementEmphasis", "governance"]
+_Severity = Literal["high", "medium", "low"]
+
+
+class _FindingCandidate(BaseModel):
+    evidence_ids: list[int]
+    severity: _Severity
+    score_component: _ScoreComponent
+    summary: str
+
+
+class _FindingBatch(BaseModel):
+    findings: list[_FindingCandidate]
+
+
+@dataclass
+class EvidenceItem:
+    """findings 증거 카탈로그 항목. hop_type/section_label/excerpt/source_ref는 전부
+    호출 전에 코드가 DB 원본 행에서 채운다 — LLM은 evidence_id로만 참조한다."""
+
+    evidence_id: int
+    hop_type: str  # financial_anomaly/note/mdna
+    section_label: str
+    excerpt: str
+    source_ref: str
+
+
+@dataclass
+class FindingCandidate:
+    evidence_ids: list[int]
+    severity: str
+    score_component: str
+    summary: str
+
+
+def _evidence_prompt(item: EvidenceItem) -> str:
+    return (
+        f"evidence_id: {item.evidence_id}\n"
+        f"섹션: {item.section_label}\n"
+        f"내용: {item.excerpt}"
+    )
+
+
+def extract_findings(client: genai.Client, evidence: list[EvidenceItem]) -> list[FindingCandidate]:
+    """한 filing의 증거 카탈로그를 한 번에 보내 findings 후보를 뽑는다.
+
+    응답의 evidence_ids가 실제 카탈로그에 없는 값을 참조하면 그 id만 걸러내고,
+    걸러낸 뒤 evidence_ids가 비게 된 finding은 통째로 버린다(모델이 근거 없이
+    지어낸 finding을 신뢰하지 않는다).
+    """
+    if not evidence:
+        return []
+
+    valid_ids = {item.evidence_id for item in evidence}
+    contents = "\n\n---\n\n".join(_evidence_prompt(item) for item in evidence)
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=_FINDINGS_SYSTEM_INSTRUCTION,
+            temperature=0.2,
+            response_mime_type="application/json",
+            response_schema=_FindingBatch,
+        ),
+    )
+
+    parsed: _FindingBatch | None = response.parsed
+    if parsed is None:
+        raise RuntimeError(
+            f"Gemini 응답이 스키마로 파싱되지 않음 (finish_reason="
+            f"{response.candidates[0].finish_reason if response.candidates else '?'}) — "
+            f"evidence={len(evidence)}건"
+        )
+
+    results: list[FindingCandidate] = []
+    for candidate in parsed.findings:
+        kept_ids = [eid for eid in candidate.evidence_ids if eid in valid_ids]
+        if not kept_ids:
+            continue
+        results.append(
+            FindingCandidate(
+                evidence_ids=kept_ids,
+                severity=candidate.severity,
+                score_component=candidate.score_component,
+                summary=candidate.summary,
+            )
+        )
     return results
