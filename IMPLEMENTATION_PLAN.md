@@ -152,7 +152,15 @@ DART Open API ──▶ [darfin-company-analysis (Python/FastAPI)]          [dar
      - **실전에서 확인한 것**: Gemini 일시적 503(과부하) 하나 발생 → 해당 filing만 `failed`로 기록되고 나머지는 계속 진행(장애 격리 원칙대로 동작). 다만 그 filing이 다음 filing의 QoQ baseline이라 재시도로 채운 뒤 `--force` 전체 재실행이 필요했음(baseline이 없으면 그 다음 filing이 "최초 filing"처럼 취급돼 상태/delta가 부정확해짐) — 순서 의존 파이프라인의 알려진 특성.
      - **알려진 한계**: ①`dividend.history`는 배당 표에 있는 당기/전기/전전기 3개 시점만 채움(진짜 연도별 배당 추이가 아니라 분기 시점 값 그대로 — 완전한 연간 추이는 여러 filing에 걸친 분기 배당 합산이 필요해 범위 밖). ②`risks`의 `status`는 'existing'/'new'만 코드가 판정(정규화 title 비교)하고, 이전엔 있었지만 이번엔 사라진 리스크는 'removed'로 남기지 않고 그냥 빠짐.
    - **범위 밖(다음 작업)**: `strategyShifts`(사업 변화 흐름 타임라인)는 한 filing이 아니라 여러 분기에 걸친 추이 분석이 필요해 별도 설계 필요.
-5. DART 폴링 스케줄러 + 파이프라인 상태 머신; Spring 조회 엔드포인트; 프론트 목데이터 교체
+5. DART 폴링 스케줄러 + 파이프라인 상태 머신; Spring 조회 엔드포인트; 프론트 목데이터 교체. **거의 완료** — Spring API/프론트 연동/스케줄러+큐까지 구현·라이브 검증됨.
+   - **Spring 조회 API** ✅ **완료** (`darfin-main`) — `GET /api/v1/companies`, `GET /api/v1/companies/{corpCode}`. `entity/analysis`의 기존 JPA 엔티티(Metrics/TextChunks/LlmSummaries)가 실제 ddl.sql과 어긋나 있었고 `ddl-auto=update`라 Hibernate가 이 파이프라인 테이블을 건드릴 위험이 있어 JdbcTemplate로만 구현(검증 중 실제로 `text_chunks`에 컬럼이 하나 추가되는 걸 확인해 3개 엔티티를 ddl.sql에 맞게 고침). `getCompanyDetail()`은 존재하지 않는 corp_code에 깨끗한 404 반환(회사가 없는 경우 vs 파이프라인 미처리 경우를 프론트가 구분).
+   - **프론트 실제 API 연결** ✅ **완료** (`darfin-front`) — `/company`, `/company/:id`의 목데이터 호출을 실제 API로 교체. `isDataRich` 판정은 `overview` 존재 여부만으로(recentFilings는 diff만 끝나도 채워져서 기준으로 부적절 — 처음엔 이 버그로 "diff는 됐지만 LLM 처리 전" 상태를 놓칠 뻔함).
+   - **스케줄러 + 우선순위 큐 + 동시 LLM 호출** ✅ **완료** — `dart_pipeline/fast_path.py`(한 filing의 LLM 호출 4개를 `ThreadPoolExecutor`로 동시 실행 — 서로 입출력이 안 겹쳐서 가능, 순차 대비 대략 2~3배 빠름), `scripts/run_daily_scan.py`(커버 대상 회사 전체의 1~3단계를 매일 실행, 새 작업은 `llm_jobs`에 priority=1로 등록), `scripts/run_llm_worker.py`(cron이 1~2분마다 호출, 가장 급한 job 1개만 처리 — cron 주기가 자연스러운 Gemini rate limit), `darfin-main`의 `getCompanyDetail()`이 데이터 빈약한 회사 조회 시 priority=0으로 큐 앞자리 승격. 프론트는 "분석 준비 중" 상태에서 10~15초 폴링으로 자동 갱신.
+     - **실전 검증 중 발견한 버그 2개**(둘 다 SK하이닉스로 파이프라인을 처음부터 다시 돌리며 발견 — 사용자가 "버그 없는지 확인해보자"고 요청):
+       1. `stock` 테이블에 SK하이닉스 이름/티커로 등록된 행의 `dart_corp_code`가 실제로는 현대차의 corp_code였음(둘 다 이 세션 이전부터 있던 기존 문제, 원인 불명 — 수동 시딩으로 추정). 데이터 삭제 후 실제 SK하이닉스 corp_code(00164779)로 재수집해 해결.
+       2. `polish_diff_entries` 등 4개 LLM 호출 전부 `thinking_config` 없이 호출되고 있었는데, 20건 배치 하나가 Gemini 2.5 Flash의 thinking 토큰만 244초 태우다 `MAX_TOKENS`로 잘려 파싱 실패 — `thinking_config=ThinkingConfig(thinking_budget=0)`으로 끄고 `max_output_tokens`도 모델 실제 한도(`client.models.get()`으로 확인한 65536)까지 올려 해결. thinking을 끄면서 지연시간도 추가로 줄어듦(부수 효과).
+     - **알려진 한계**: `llm_jobs`가 15분 넘게 'running'이면 방치된 것으로 보고 다시 집어가지만(워커 크래시 대비), 정교한 재시도 백오프는 없음. `darfin-main`/파이프라인이 아직 서로 다른 DB(`darfin`/`darfin_dev`)를 보는 문제는 미해결 — 실제 배포 전 통일 필요.
+   - **범위 밖(다음 작업)**: 커버 대상 회사 확장(현재 삼성전자·SK하이닉스 2개사만), `strategyShifts`.
 
 이 순서의 이유: LLM 비용을 쓰기 전에 모든 단계를 실제 공시로 테스트할 수 있고, LLM은 변경된 구간에 대해서만 과금된다.
 

@@ -529,3 +529,71 @@ def insert_company_overview(conn, row: dict) -> None:
             """,
             row,
         )
+
+
+# ── LLM 처리 대기열 (일일 스캔이 채우고, 워커가 소비) ──────────────────────
+# 작업 단위는 회사(corp_code) — summarize/findings/overview 오케스트레이션
+# 함수들이 이미 "이 회사의 밀린 filing을 전부 찾아서 처리" 방식이라 필링
+# 단위 추적이 필요 없다.
+
+def enqueue_llm_job(conn, corp_code: str, priority: int = 1) -> None:
+    """이미 pending/running인 job이 있으면 더 급한 쪽(작은 값)으로 우선순위만
+    올리고, 없으면 새로 추가한다. priority: 0=on_demand, 1=scheduled."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, priority FROM llm_jobs WHERE corp_code = %s AND status IN ('pending', 'running')",
+            (corp_code,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            existing_id, existing_priority = existing
+            if priority < existing_priority:
+                cur.execute("UPDATE llm_jobs SET priority = %s WHERE id = %s", (priority, existing_id))
+            return
+        cur.execute(
+            "INSERT INTO llm_jobs (corp_code, priority) VALUES (%s, %s)",
+            (corp_code, priority),
+        )
+
+
+def claim_next_job(conn) -> dict | None:
+    """대기 중인 job 중 우선순위가 가장 급한(priority 작고 오래된) 1건을
+    잠그고(FOR UPDATE) 'running'으로 표시한다. 같은 트랜잭션 커밋 전까지
+    다른 워커가 같은 행을 못 집는다(row lock).
+
+    'running'으로 바뀐 뒤 워커가 죽으면(LLM 처리 중 크래시 등) 그 job은
+    영영 'running'에 머무를 수 있다 — claim 자체는 짧게 커밋되고 그 뒤의
+    느린 처리 도중 죽는 시나리오이므로 트랜잭션 롤백으로는 복구가 안 된다.
+    그래서 15분 넘게 'running'인 job은 방치된 것으로 보고 다시 집는다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, corp_code FROM llm_jobs "
+            "WHERE status = 'pending' "
+            "   OR (status = 'running' AND started_at < NOW() - INTERVAL 15 MINUTE) "
+            "ORDER BY priority ASC, requested_at ASC LIMIT 1 FOR UPDATE"
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        job_id, corp_code = row
+        cur.execute(
+            "UPDATE llm_jobs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (job_id,),
+        )
+    return {"id": job_id, "corp_code": corp_code}
+
+
+def mark_job_done(conn, job_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE llm_jobs SET status = 'done', completed_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (job_id,),
+        )
+
+
+def mark_job_failed(conn, job_id: int, error_message: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE llm_jobs SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = %s WHERE id = %s",
+            (error_message[:300], job_id),
+        )

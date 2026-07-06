@@ -35,6 +35,15 @@ MODEL_NAME = "gemini-2.5-flash"
 _PRICE_PER_1M_INPUT = 0.30
 _PRICE_PER_1M_OUTPUT = 2.50
 
+# 여기서 하는 4가지 작업(요약/분류/추출)은 다단계 추론이 필요 없어 thinking을
+# 끈다 — 실제로 SK하이닉스 검증 중 20건 배치 하나가 thinking 토큰만 244초
+# 태우다 MAX_TOKENS로 잘려 응답 파싱에 실패하는 걸 확인했다(thinking_budget=0
+# 없이는 출력 토큰 예산을 내부 추론이 다 써버릴 수 있음). thinking을 꺼도
+# 33건짜리 배치는 16384로 여전히 잘렸다 — gemini-2.5-flash의 실제
+# output_token_limit(65536, client.models.get()으로 확인)까지 열어준다.
+_NO_THINKING = types.ThinkingConfig(thinking_budget=0)
+_MAX_OUTPUT_TOKENS = 65536
+
 _SYSTEM_INSTRUCTION = (
     "당신은 기업 공시 비교 결과를 요약하는 보조 도구입니다. "
     "입력은 여러 개의 '변경 전'/'변경 후' 항목으로 구성된 배열이며, 각 항목은 "
@@ -109,6 +118,8 @@ def polish_diff_entries(client: genai.Client, entries: list[DiffEntry]) -> list[
             temperature=0.1,
             response_mime_type="application/json",
             response_schema=_DiffSummaryBatch,
+            thinking_config=_NO_THINKING,
+            max_output_tokens=_MAX_OUTPUT_TOKENS,
         ),
     )
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -244,6 +255,8 @@ def extract_findings(client: genai.Client, evidence: list[EvidenceItem]) -> list
             temperature=0.2,
             response_mime_type="application/json",
             response_schema=_FindingBatch,
+            thinking_config=_NO_THINKING,
+            max_output_tokens=_MAX_OUTPUT_TOKENS,
         ),
     )
 
@@ -331,6 +344,8 @@ def extract_risks(client: genai.Client, evidence: list[EvidenceItem]) -> list[Ri
             temperature=0.2,
             response_mime_type="application/json",
             response_schema=_RiskBatch,
+            thinking_config=_NO_THINKING,
+            max_output_tokens=_MAX_OUTPUT_TOKENS,
         ),
     )
 
@@ -408,6 +423,8 @@ def generate_panel_insights(client: genai.Client, panels: list[PanelFact]) -> li
             temperature=0.3,
             response_mime_type="application/json",
             response_schema=_PanelInsightBatch,
+            thinking_config=_NO_THINKING,
+            max_output_tokens=_MAX_OUTPUT_TOKENS,
         ),
     )
 
