@@ -1,11 +1,14 @@
 """일일 스캔 CLI — 커버 대상 회사 전체(companies 테이블) 순회하며 1~3단계
-(수집→파싱→재무제표→diff)를 실행하고, 새로 diff된 filing이 있으면 LLM
-처리 대기열(llm_jobs)에 등록한다. cron이 하루 1회 호출한다(예: 새벽).
+(수집→파싱→재무제표→diff)를 실행한다. cron이 하루 1회 호출한다(예: 새벽).
 
 1~3단계는 DART API 호출과 순수 계산뿐이라 커버 대상 전체에 대해 매일
-돌려도 비용/속도 문제가 없다. 비싼 LLM 단계(4단계)는 여기서 처리하지
-않고 큐에만 등록 — 별도 워커(scripts/run_llm_worker.py)가 Gemini rate
-limit을 지키며 순서대로 소비한다.
+돌려도 비용/속도 문제가 없다. **LLM 단계(4단계)는 여기서 절대 트리거하지
+않는다** — 아무도 보지 않을 회사까지 매일 Gemini 비용을 쓰게 되므로,
+LLM 처리는 순수 on-demand로만 돈다(darfin-main의 GET /api/v1/companies/
+{corpCode}가 overview 없는 회사를 조회할 때 llm_jobs에 등록 →
+scripts/run_llm_worker.py가 소비). 이 스크립트는 diff까지만 최신으로
+유지해서, 다음에 사용자가 클릭했을 때 diff는 이미 끝나 있고 LLM만
+기다리면 되게 한다.
 
 예:
     python scripts/run_daily_scan.py
@@ -37,7 +40,7 @@ def _covered_corp_codes(conn) -> list[str]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="일일 스캔: 커버 대상 회사 전체 1~3단계 + LLM 큐 등록")
+    ap = argparse.ArgumentParser(description="일일 스캔: 커버 대상 회사 전체 1~3단계(수집/파싱/재무제표/diff)")
     ap.add_argument("--from", dest="bgn_de", default=None, help="수집 시작일 YYYYMMDD (기본: 90일 전)")
     args = ap.parse_args()
 
@@ -67,10 +70,10 @@ def main() -> int:
             with db.connection() as conn:
                 pending = db.filings_for_overview(conn, corp_code)
                 has_new = any(f["is_target"] for f in pending)
+                # LLM 큐 등록은 하지 않는다 — 사용자가 클릭할 때 darfin-main이
+                # priority=0으로 등록한다. 여기선 모니터링용으로만 로그를 남긴다.
                 if has_new:
-                    db.enqueue_llm_job(conn, corp_code, priority=1)
-                    conn.commit()
-                    print(f"{stock_code}({corp_code}): 새 작업 → llm_jobs 등록")
+                    print(f"{stock_code}({corp_code}): 새 diff 있음 (LLM은 클릭 시 처리)")
                 else:
                     print(f"{stock_code}({corp_code}): 변경 없음")
         except Exception as e:  # 한 회사 실패가 나머지를 막지 않게
