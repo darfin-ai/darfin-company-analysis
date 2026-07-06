@@ -384,15 +384,18 @@ def mdna_chunk_for_filing(conn, rcept_no: str) -> dict | None:
     """이사의 경영진단 및 분석의견(MD&A) 텍스트 청크 1건.
 
     12개 표준 섹션에 없어(canonical_label NULL) section_diffs로 잡히지 않으므로
-    text_chunks에서 제목으로 직접 조회한다. 여러 하위 청크로 쪼개졌을 수 있어
-    가장 긴 것을 대표로 쓴다.
+    text_chunks에서 제목으로 직접 조회한다. 실제 서술은 최상위 헤더 청크(예:
+    "IV. 이사의 경영진단 및 분석의견", content 대개 빈 문자열)가 아니라 그
+    하위 청크(예: "3. 재무상태 및 영업실적")에 들어있다 — section_title이 아니라
+    breadcrumb으로 매칭해야 하위 청크까지 잡힌다. 여러 하위 청크로 쪼개졌을 수
+    있어 가장 긴 것을 대표로 쓴다.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT section_title, breadcrumb, content
             FROM text_chunks
-            WHERE rcept_no = %s AND section_title LIKE '%%경영진단%%'
+            WHERE rcept_no = %s AND breadcrumb LIKE '%%경영진단%%'
             ORDER BY CHAR_LENGTH(content) DESC
             LIMIT 1
             """,
@@ -528,6 +531,81 @@ def insert_company_overview(conn, row: dict) -> None:
             VALUES (%(rcept_no)s, %(corp_code)s, %(overview_json)s, %(model_used)s)
             """,
             row,
+        )
+
+
+def filings_for_ai_insights(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """company_overview 2단계(insight/risks) 대상 filings. 1단계
+    (build_deterministic_overview_for_stock)가 이미 결정론적 부분만 채워 둔
+    행 중 `aiInsightsReady`가 false인 것, 그리고 아직 company_overview 행
+    자체가 없는 것(1단계가 아직 안 돈 경우 — fast_path.py가 폴백으로 처리)
+    까지 실제 처리 대상. baseline 체이닝에 전체 이력이 필요하므로
+    filings_for_overview와 같은 모양(전체 반환 + is_target)으로 맞춘다.
+    `aiInsightsReady` 필드 자체가 없는 구버전 행은 이미 완료된 것으로
+    간주(하위 호환)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.rcept_no, f.corp_code, f.bsns_year, f.reprt_code, f.filed_date,
+                   co.overview_json
+            FROM filings f
+            LEFT JOIN company_overview co ON co.rcept_no = f.rcept_no
+            WHERE f.corp_code = %s AND f.pipeline_status != 'FAILED'
+            ORDER BY f.bsns_year, f.filed_date
+            """,
+            (corp_code,),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for r in rows:
+        overview_json = r.pop("overview_json")
+        if overview_json is None:
+            r["is_target"] = True  # overview 자체가 없음 — fast_path 폴백 경로
+            continue
+        overview = json.loads(overview_json)
+        ready = overview.get("aiInsightsReady") is not False
+        r["is_target"] = force or not ready
+    return rows
+
+
+def update_overview_insights(conn, rcept_no: str, insight_by_key: dict, risks: list[dict]) -> None:
+    """1단계가 이미 써둔 company_overview 행에 insight/risks만 patch한다 —
+    결정론적 부분(segments/products/regions/shareholders/dividend 수치)은
+    그대로 보존."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT overview_json FROM company_overview WHERE rcept_no = %s", (rcept_no,))
+        row = cur.fetchone()
+        overview = json.loads(row[0])
+        overview["segmentInsight"] = insight_by_key.get("segment")
+        overview["productInsight"] = insight_by_key.get("product")
+        overview["regionInsight"] = insight_by_key.get("region")
+        overview["shareholderInsight"] = insight_by_key.get("shareholder")
+        if overview.get("dividend"):
+            overview["dividend"]["insight"] = insight_by_key.get("dividend")
+        overview["risks"] = risks
+        overview["aiInsightsReady"] = True
+        cur.execute(
+            "UPDATE company_overview SET overview_json = %s WHERE rcept_no = %s",
+            (json.dumps(overview, ensure_ascii=False), rcept_no),
+        )
+
+
+def update_overview_strategy_shifts(conn, rcept_no: str, shifts: list[dict]) -> None:
+    """가장 최근 filing의 company_overview에 strategyShifts만 patch한다.
+
+    strategyShifts는 filing 단위가 아니라 회사 전체 역사를 봐야 하는 질문이라
+    한 회사당 한 번만 계산되고, 최신 filing의 개요에만 붙는다(다른 필드는
+    건드리지 않음)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT overview_json FROM company_overview WHERE rcept_no = %s", (rcept_no,))
+        row = cur.fetchone()
+        if row is None:
+            return
+        overview = json.loads(row[0])
+        overview["strategyShifts"] = shifts
+        cur.execute(
+            "UPDATE company_overview SET overview_json = %s WHERE rcept_no = %s",
+            (json.dumps(overview, ensure_ascii=False), rcept_no),
         )
 
 

@@ -28,6 +28,7 @@ from dart_pipeline import DartClient, db, ingest_company
 from dart_pipeline.corp_codes import load_corp_codes
 from dart_pipeline.diff_ingest import diff_filings_for_stock
 from dart_pipeline.metrics_ingest import fetch_metrics_for_stock
+from dart_pipeline.overview_ingest import build_deterministic_overview_for_stock
 from dart_pipeline.parse_ingest import parse_filings_for_stock
 
 
@@ -66,16 +67,16 @@ def main() -> int:
             parse_filings_for_stock(client, stock_code)
             fetch_metrics_for_stock(client, stock_code)
             diff_filings_for_stock(client, stock_code)
+            # 결정론적 부분(segments/products/regions/shareholders/dividend)은
+            # LLM이 전혀 없어 여기서 바로 채운다 — 클릭을 기다릴 필요 없음.
+            # insight/risks/findings(진짜 LLM 단계)만 on-demand로 남긴다.
+            overview_results = build_deterministic_overview_for_stock(client, stock_code)
+            built = [r for r in overview_results if r.action == "built"]
 
-            with db.connection() as conn:
-                pending = db.filings_for_overview(conn, corp_code)
-                has_new = any(f["is_target"] for f in pending)
-                # LLM 큐 등록은 하지 않는다 — 사용자가 클릭할 때 darfin-main이
-                # priority=0으로 등록한다. 여기선 모니터링용으로만 로그를 남긴다.
-                if has_new:
-                    print(f"{stock_code}({corp_code}): 새 diff 있음 (LLM은 클릭 시 처리)")
-                else:
-                    print(f"{stock_code}({corp_code}): 변경 없음")
+            if built:
+                print(f"{stock_code}({corp_code}): 새 filing {len(built)}건 — 개요 패널 채움(LLM은 클릭 시)")
+            else:
+                print(f"{stock_code}({corp_code}): 변경 없음")
         except Exception as e:  # 한 회사 실패가 나머지를 막지 않게
             print(f"{stock_code}({corp_code}): 실패 — {e}")
 

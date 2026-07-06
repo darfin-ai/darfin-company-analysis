@@ -110,6 +110,105 @@ def _norm_title(title: str) -> str:
     return "".join(title.split())
 
 
+def build_deterministic_overview_for_stock(
+    client: DartClient,
+    stock_code: str,
+    force: bool = False,
+    limit: int | None = None,
+) -> list[OverviewResult]:
+    """company_overview의 1단계(결정론적 부분만) — segments/products/regions/
+    shareholders/dividend를 tables_json에서 뽑아 저장한다. Gemini 호출이 전혀
+    없어 커버 대상 전체에 매일 돌려도 무해하다(scripts/run_daily_scan.py가
+    diff 직후 호출). `*Insight` 필드는 전부 null, `risks`는 빈 배열,
+    `aiInsightsReady: false`로 저장 — 2단계(dart_pipeline.fast_path)가 나중에
+    이 행을 UPDATE해서 insight/risks를 채우고 true로 바꾼다.
+
+    대상 filing은 build_overview_for_stock과 동일(company_overview 행 자체가
+    없는 것) — 이미 1단계든 2단계든 처리된 filing은 건드리지 않는다.
+    """
+    book = load_corp_codes(client)
+    corp = book.by_stock_code(stock_code)
+    if corp is None:
+        raise ValueError(f"종목코드 {stock_code}에 해당하는 기업 없음 (corpCode.xml 기준)")
+
+    results: list[OverviewResult] = []
+    overview_cache: dict[str, dict] = {}
+
+    with db.connection() as conn:
+        raw = db.filings_for_overview(conn, corp.corp_code, force=force)
+        is_target = {r["rcept_no"] for r in raw if r["is_target"]}
+        ordered = order_filings(raw)
+
+        target_count = 0
+        for f in ordered:
+            rcept_no, bsns_year, reprt_code = f["rcept_no"], f["bsns_year"], f["reprt_code"]
+
+            baseline = resolve_baselines(ordered, rcept_no)["QoQ"]
+            baseline_overview = None
+            if baseline is not None:
+                baseline_overview = overview_cache.get(baseline["rcept_no"]) or db.overview_for_filing(
+                    conn, baseline["rcept_no"]
+                )
+
+            if rcept_no not in is_target:
+                cached = db.overview_for_filing(conn, rcept_no)
+                if cached is not None:
+                    overview_cache[rcept_no] = cached
+                continue
+
+            if limit is not None and target_count >= limit:
+                continue
+            target_count += 1
+
+            try:
+                chunks = db.load_chunks(conn, rcept_no)
+                dividend_chunk = db.dividend_chunk_for_filing(conn, rcept_no)
+
+                baseline_segments = baseline_overview.get("segments") if baseline_overview else None
+                baseline_regions = baseline_overview.get("regions") if baseline_overview else None
+
+                segments = compute_segment_status(extract_segments(chunks), baseline_segments)
+                products = extract_products(chunks)
+                regions = extract_regions(chunks, baseline_regions)
+                shareholders = extract_shareholders(chunks)
+                dividend = extract_dividend(dividend_chunk)
+
+                overview = {
+                    "segments": segments,
+                    "segmentInsight": None,
+                    "products": products,
+                    "productInsight": None,
+                    "customers": [],
+                    "regions": regions,
+                    "regionInsight": None,
+                    "risks": [],
+                    "shareholders": shareholders,
+                    "shareholderInsight": None,
+                    "dividend": ({**dividend, "insight": None} if dividend else None),
+                    "aiInsightsReady": False,
+                }
+
+                db.delete_company_overview(conn, rcept_no)
+                db.insert_company_overview(
+                    conn,
+                    {
+                        "rcept_no": rcept_no,
+                        "corp_code": corp.corp_code,
+                        "overview_json": json.dumps(overview, ensure_ascii=False),
+                        "model_used": "none",  # 이 단계는 LLM을 안 씀
+                    },
+                )
+                conn.commit()  # 공시 1건 = 커밋 1건: 중단돼도 완료분 보존
+
+                overview_cache[rcept_no] = overview
+                results.append(OverviewResult(rcept_no, bsns_year, reprt_code, "built"))
+            except Exception as e:  # 한 건의 실패가 나머지 공시 처리를 막지 않게
+                conn.rollback()
+                results.append(OverviewResult(rcept_no, bsns_year, reprt_code, "failed", detail=str(e)))
+
+    return results
+
+
 def build_overview_for_stock(
     client: DartClient,
     gemini: genai.Client,

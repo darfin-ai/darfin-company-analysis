@@ -22,6 +22,7 @@ from google import genai
 from dart_pipeline import db
 from dart_pipeline.diff import order_filings, resolve_baselines
 from dart_pipeline.fast_path import process_filing_concurrent
+from dart_pipeline.strategy_shifts_ingest import refresh_strategy_shifts_for_company
 
 
 def main() -> int:
@@ -44,9 +45,10 @@ def main() -> int:
     overview_cache: dict[str, dict] = {}
     all_ok = True
     detail = ""
+    processed_count = 0
 
     with db.connection() as conn:
-        raw = db.filings_for_overview(conn, corp_code)
+        raw = db.filings_for_ai_insights(conn, corp_code)
         is_target = {r["rcept_no"] for r in raw if r["is_target"]}
         ordered = order_filings(raw)
 
@@ -78,6 +80,7 @@ def main() -> int:
             detail = result.detail
             break  # 이후 filing은 baseline이 끊겨 의미가 없으므로 중단
 
+        processed_count += 1
         with db.connection() as conn:
             overview_cache[rcept_no] = db.overview_for_filing(conn, rcept_no)
 
@@ -88,6 +91,18 @@ def main() -> int:
         else:
             db.mark_job_failed(conn, job["id"], detail)
             print(f"job #{job['id']} 실패: {detail}")
+
+    # strategyShifts는 filing 단위가 아니라 회사 전체 역사를 한 번에 보는
+    # 질문이라 여기서 한 번만 계산한다. 새로 처리한 filing이 없으면(이미
+    # 다 끝난 회사가 다시 큐에 올라온 경우) 다시 계산해도 결과가 같으므로
+    # Gemini 호출을 아낀다.
+    if all_ok and processed_count > 0:
+        try:
+            with db.connection() as conn:
+                n = refresh_strategy_shifts_for_company(conn, gemini, corp_code)
+            print(f"  전략 전환 감지: {n}건")
+        except Exception as e:  # 부가 기능 실패가 job 성공 여부를 바꾸지 않음
+            print(f"  전략 전환 감지 실패(무시): {e}")
 
     return 0 if all_ok else 1
 
