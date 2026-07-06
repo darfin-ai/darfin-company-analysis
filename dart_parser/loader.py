@@ -21,6 +21,15 @@ from lxml import etree
 # XML 사전정의 엔티티(&amp; &lt; ...)와 문자 참조(&#39; &#x27;)가 아닌 맨 & 탐지
 _BARE_AMP = re.compile(r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)")
 
+# 본문 텍스트에 이스케이프 없이 섞인 '<삭제 2012.3.5>' 같은 개정이력 표기.
+# DART 문서의 실제 태그명은 전부 영문 대문자(TITLE/SECTION-1/TD 등)라
+# '<' 바로 뒤에 한글이 오면 태그가 아니라 텍스트로 확정할 수 있다 — 이걸
+# 이스케이프하지 않으면 lxml이 가짜 태그로 오인해 attribute 파싱 에러를
+# 내고, 에러가 한 섹션에 몰리면 recover 모드가 뒤따르는 섹션 전체(예:
+# SK하이닉스 2025 사업보고서의 'VII. 주주에 관한 사항' 이후)를 통째로
+# 유실한다.
+_BARE_LT_KOREAN = re.compile(r"<(?=[가-힣])")
+
 _DOC_END = "</DOCUMENT>"
 
 _DECL_ENCODING = re.compile(rb'encoding\s*=\s*["\']([A-Za-z0-9._-]+)["\']')
@@ -67,6 +76,11 @@ def load_document(path: str | Path) -> tuple[etree._Element, list[str]]:
     text, n_amp = _BARE_AMP.subn("&amp;", text)
     if n_amp:
         warnings.append(f"escaped {n_amp} bare '&'")
+
+    # 2-b. 태그처럼 보이는 한글 시작 '<' 이스케이프 (개정이력 표기 등)
+    text, n_lt = _BARE_LT_KOREAN.subn("&lt;", text)
+    if n_lt:
+        warnings.append(f"escaped {n_lt} bare '<' followed by Korean text")
 
     # 3. 관대한 파싱. 문자열에 encoding 선언이 있으면 lxml이 거부하므로
     #    다시 bytes로 인코딩해서 넘긴다.

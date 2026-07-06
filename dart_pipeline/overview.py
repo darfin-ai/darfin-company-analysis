@@ -56,31 +56,53 @@ def _header_text(rows: list[list[dict]], n: int = 1) -> str:
 # ── segments ────────────────────────────────────────────────────────────
 
 def extract_segments(chunks: list[dict]) -> list[dict]:
-    """'부 문 | 주요 제품 | 매출액 | 비중' 표에서 사업 부문 추출."""
+    """'(부문|구분) | 주요제품 | 매출액 | 비중' 표에서 사업 부문 추출.
+
+    부문 이름 열 헤더는 '부문'뿐 아니라 '구분'으로도 쓰이고(단일 사업부문
+    회사가 흔히 이렇게 씀 — 예: SK하이닉스), 매출액/비중/주요제품 열의
+    순서도 회사마다 달라(SK하이닉스는 주요제품이 맨 끝) 위치가 아니라
+    헤더 라벨로 열을 찾는다.
+    """
     for chunk in chunks:
         for table in _tables(chunk):
             rows = table["rows"]
             if not rows:
                 continue
-            header = _header_text(rows)
-            if not ("부문" in header and "주요제품" in header and "매출액" in header and "비중" in header):
+            header_cells = [_norm(c["text"]) for c in rows[0]]
+            header = "".join(header_cells)
+            if not (
+                ("부문" in header or "구분" in header)
+                and "주요제품" in header
+                and "매출액" in header
+                and "비중" in header
+            ):
                 continue
+
+            share_idx = next((i for i, c in enumerate(header_cells) if "비중" in c), None)
+            revenue_idx = next(
+                (i for i, c in enumerate(header_cells) if "매출액" in c and i != share_idx), None
+            )
+            product_idx = next((i for i, c in enumerate(header_cells) if "주요제품" in c), None)
+            if share_idx is None or revenue_idx is None:
+                continue
+
             out = []
             for row in rows[1:]:
                 cells = [c["text"].strip() for c in row]
-                if len(cells) < 3:
+                if len(cells) <= max(share_idx, revenue_idx):
                     continue
                 name = cells[0]
                 if _norm(name) in _SKIP_LABELS:
                     continue
-                share = _parse_percent(cells[-1])
-                revenue = _parse_amount(cells[-2])
+                share = _parse_percent(cells[share_idx])
+                revenue = _parse_amount(cells[revenue_idx])
                 if share is None or revenue is None:
                     continue
+                description = cells[product_idx] if product_idx is not None and product_idx < len(cells) else ""
                 out.append(
                     {
                         "name": name,
-                        "description": " ".join(cells[1:-2]).strip(),
+                        "description": description,
                         "revenue": revenue,
                         "revenueShare": share,
                     }
@@ -192,12 +214,19 @@ def extract_regions(chunks: list[dict], baseline_regions: list[dict] | None) -> 
 
 # ── shareholders ────────────────────────────────────────────────────────
 
+# 보통주와 동급으로 취급하는 라벨. 일부 회사(예: SK하이닉스)는 보통주/우선주
+# 구분 없이 '의결권 있는 주식'으로만 표기한다 — 실질은 보통주와 동일.
+_COMMON_SHARE_LABELS = {"보통주", "의결권 있는 주식"}
+_PREFERRED_SHARE_LABELS = {"우선주"}
+
+
 def extract_shareholders(chunks: list[dict]) -> list[dict]:
     """'소유주식수및지분율' 표에서 보통주 기준 상위 주주를 뽑는다.
 
-    rowspan 붕괴로 같은 주주의 우선주 행이 이름 없이("보통주"/"우선주"만) 나올
+    rowspan 붕괴로 같은 주주의 우선주 행이 이름 없이(주식종류 라벨만) 나올
     수 있어 직전 이름/관계를 상태로 이어받는다.
     """
+    share_labels = _COMMON_SHARE_LABELS | _PREFERRED_SHARE_LABELS
     for chunk in chunks:
         for table in _tables(chunk):
             rows = table["rows"]
@@ -213,7 +242,7 @@ def extract_shareholders(chunks: list[dict]) -> list[dict]:
                 cells = [c["text"].strip() for c in row]
                 if not cells:
                     continue
-                share_type_idx = next((i for i, c in enumerate(cells) if c in ("보통주", "우선주")), None)
+                share_type_idx = next((i for i, c in enumerate(cells) if c in share_labels), None)
                 if share_type_idx is None:
                     continue
                 share_type = cells[share_type_idx]
@@ -225,7 +254,7 @@ def extract_shareholders(chunks: list[dict]) -> list[dict]:
                     relation = cells[1] if len(cells) > 1 and share_type_idx > 1 else None
                     current_name, current_relation = name, relation
 
-                if share_type != "보통주" or not name or name.startswith("※") or _norm(name) in _SKIP_LABELS:
+                if share_type not in _COMMON_SHARE_LABELS or not name or name.startswith("※") or _norm(name) in _SKIP_LABELS:
                     continue
 
                 floats = [parse_number(c) for c in cells if parse_number(c) is not None and "." in c]
