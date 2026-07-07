@@ -60,8 +60,11 @@ settings.gradle.kts
 .env.*
 !.env.example
 
-# Cursor MCP config (may contain API tokens)
-.cursor/mcp.json
+# Agent context (local only)
+AGENTS.md
+CLAUDE.md
+.cursor/
+
 # Python
 __pycache__/
 *.pyc
