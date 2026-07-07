@@ -1,0 +1,32 @@
+---
+description: Company analysis pipeline conventions
+globs: "{dart_pipeline/**,dart_parser/**,scripts/**}"
+alwaysApply: false
+---
+
+# Pipeline conventions
+
+Read [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) before any pipeline changes.
+
+## State machine
+
+`RAW → PARSED → DIFFED → SUMMARIZED` — each stage idempotent per `rcept_no`.
+
+## Rules
+
+- Raw XML stays in `data/` filesystem, never in MySQL
+- LLM input = diffs and extracted facts only, never full filing text
+- All outputs must mechanically cite source sections (`FilingExcerptRef`)
+- QoQ baseline = prior filing; YoY = same quarter prior year
+- Record model/tokens/cost per LLM call
+
+## Scripts
+
+- Manual: `scripts/{stage}_*.py --stock <ticker>`
+- Cron: `run_daily_scan.py` (no Gemini), `run_llm_worker.py` (on-demand queue)
+
+## Do not
+
+- Add HTTP endpoints — this repo is CLI + cron only
+- Touch `disclosure` / `ai_summary_result` tables (수시공시 = darfin-disclosure)
+- Change output shapes without updating `types.js`
