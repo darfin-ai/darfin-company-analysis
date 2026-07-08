@@ -24,6 +24,7 @@ from .corp_codes import load_corp_codes
 from .diff import order_filings, resolve_baselines
 from .llm import MODEL_NAME, EvidenceItem, PanelFact, extract_risks, generate_panel_insights
 from .overview import (
+    build_mdna_entry,
     compute_segment_status,
     extract_dividend,
     extract_products,
@@ -31,6 +32,7 @@ from .overview import (
     extract_segments,
     extract_shareholders,
 )
+from .scoring import quarter_label
 
 _RISK_EXCERPT_MAX = 500
 
@@ -163,15 +165,26 @@ def build_deterministic_overview_for_stock(
             try:
                 chunks = db.load_chunks(conn, rcept_no)
                 dividend_chunk = db.dividend_chunk_for_filing(conn, rcept_no)
+                mdna_chunk = db.mdna_chunk_for_filing(conn, rcept_no)
 
                 baseline_segments = baseline_overview.get("segments") if baseline_overview else None
                 baseline_regions = baseline_overview.get("regions") if baseline_overview else None
+                baseline_mdna_history = baseline_overview.get("mdnaHistory") if baseline_overview else None
 
                 segments = compute_segment_status(extract_segments(chunks), baseline_segments)
                 products = extract_products(chunks)
                 regions = extract_regions(chunks, baseline_regions)
                 shareholders = extract_shareholders(chunks)
-                dividend = extract_dividend(dividend_chunk)
+                dividend = extract_dividend(
+                    dividend_chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                )
+                mdna_entry = build_mdna_entry(
+                    rcept_no, bsns_year, reprt_code, quarter_label(bsns_year, reprt_code),
+                    mdna_chunk["content"] if mdna_chunk else None,
+                )
+                mdna_history = list(baseline_mdna_history or [])
+                if mdna_entry is not None:
+                    mdna_history.append(mdna_entry)
 
                 overview = {
                     "segments": segments,
@@ -185,6 +198,7 @@ def build_deterministic_overview_for_stock(
                     "shareholders": shareholders,
                     "shareholderInsight": None,
                     "dividend": ({**dividend, "insight": None} if dividend else None),
+                    "mdnaHistory": mdna_history,
                     "aiInsightsReady": False,
                 }
 
@@ -256,16 +270,27 @@ def build_overview_for_stock(
                 chunks = db.load_chunks(conn, rcept_no)
                 dividend_chunk = db.dividend_chunk_for_filing(conn, rcept_no)
                 risk_chunks = db.risk_chunks_for_filing(conn, rcept_no)
+                mdna_chunk = db.mdna_chunk_for_filing(conn, rcept_no)
 
                 baseline_segments = baseline_overview.get("segments") if baseline_overview else None
                 baseline_regions = baseline_overview.get("regions") if baseline_overview else None
+                baseline_mdna_history = baseline_overview.get("mdnaHistory") if baseline_overview else None
 
                 segments = compute_segment_status(extract_segments(chunks), baseline_segments)
                 products = extract_products(chunks)
                 regions = extract_regions(chunks, baseline_regions)
                 shareholders = extract_shareholders(chunks)
-                dividend = extract_dividend(dividend_chunk)
+                dividend = extract_dividend(
+                    dividend_chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                )
                 risks = _build_risks(gemini, rcept_no, risk_chunks, baseline_overview)
+                mdna_entry = build_mdna_entry(
+                    rcept_no, bsns_year, reprt_code, quarter_label(bsns_year, reprt_code),
+                    mdna_chunk["content"] if mdna_chunk else None,
+                )
+                mdna_history = list(baseline_mdna_history or [])
+                if mdna_entry is not None:
+                    mdna_history.append(mdna_entry)
 
                 panel_facts = []
                 panel_keys = []
@@ -311,6 +336,7 @@ def build_overview_for_stock(
                     "dividend": (
                         {**dividend, "insight": insight_by_key.get("dividend")} if dividend else None
                     ),
+                    "mdnaHistory": mdna_history,
                 }
 
                 db.delete_company_overview(conn, rcept_no)

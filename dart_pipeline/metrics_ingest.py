@@ -25,8 +25,11 @@ class MetricsResult:
     detail: str = ""
 
 
-def fetch_metrics_for_stock(client: DartClient, stock_code: str) -> list[MetricsResult]:
-    """한 기업의, metrics가 아직 없는 모든 filings에 연결+별도 재무제표를 적재."""
+def fetch_metrics_for_stock(client: DartClient, stock_code: str, force: bool = False) -> list[MetricsResult]:
+    """한 기업의, metrics가 아직 없는 모든 filings에 연결+별도 재무제표를 적재.
+
+    force=True면 이미 적재된 filings도 다시 받아 교체한다.
+    """
     book = load_corp_codes(client)
     corp = book.by_stock_code(stock_code)
     if corp is None:
@@ -34,7 +37,7 @@ def fetch_metrics_for_stock(client: DartClient, stock_code: str) -> list[Metrics
 
     results: list[MetricsResult] = []
     with db.connection() as conn:
-        targets = db.filings_missing_metrics(conn, corp.corp_code)
+        targets = db.filings_missing_metrics(conn, corp.corp_code, force=force)
 
         for f in targets:
             rcept_no, bsns_year, reprt_code = f["rcept_no"], f["bsns_year"], f["reprt_code"]

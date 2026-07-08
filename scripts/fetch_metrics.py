@@ -21,10 +21,11 @@ REPRT_LABELS = {"11011": "사업", "11012": "반기", "11013": "1분기", "11014
 def main() -> int:
     ap = argparse.ArgumentParser(description="DART 재무 수치(metrics) 적재")
     ap.add_argument("--stock", required=True, help="종목코드, 예: 005930")
+    ap.add_argument("--force", action="store_true", help="이미 적재된 filings도 다시 받아 교체 (예: 스키마 컬럼 추가 후 재적재)")
     args = ap.parse_args()
 
     client = DartClient()
-    results = fetch_metrics_for_stock(client, args.stock)
+    results = fetch_metrics_for_stock(client, args.stock, force=args.force)
 
     if not results:
         print("적재 대상 없음 (모든 filings에 이미 metrics가 있거나, filings가 없음)")

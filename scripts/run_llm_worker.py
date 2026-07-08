@@ -1,10 +1,16 @@
-"""LLM 처리 대기열 워커 CLI — cron이 1~2분마다 호출한다.
+"""LLM 처리 대기열 워커 CLI — cron이 1분마다 호출한다.
 
-`llm_jobs`에서 가장 급한(priority 낮고 오래된) 1건을 집어, 그 회사의 밀린
-filing을 시간순으로 순회하며 `dart_pipeline.fast_path.process_filing_concurrent`
-로 처리한다(filing 안의 LLM 호출 4개는 동시 실행, filing 간은 baseline
-체이닝 때문에 순차). 호출당 최대 1개 job만 처리 — cron 주기가 자연스러운
-Gemini rate limit 역할을 한다.
+`llm_jobs`에서 가장 오래된 job부터 순서대로(FIFO, 등록 경로가 on-demand
+하나뿐이라 우선순위 없음) 집어, 그 회사의 밀린 filing을 시간순으로 순회하며
+`dart_pipeline.fast_path.process_filing_concurrent`로 처리한다(filing 안의
+LLM 호출 4개는 동시 실행, filing 간은 baseline 체이닝 때문에 순차).
+
+한 번 호출되면 대기열이 빌 때까지, 혹은 TIME_BUDGET_SECONDS를 넘길 때까지
+계속 다음 job을 이어서 처리한다(호출당 1개만 처리하던 이전 방식은 cron
+주기(1~2분)만큼 사용자가 클릭 직후 기다려야 했음 — 대부분의 시간 큐가
+비어 있는 on-demand 워크로드에서 이 지연이 프론트 폴링 창(2분)을 잠식하는
+게 문제였다). Gemini rate limit은 시간 예산 자체가 자연스러운 상한 역할을
+한다.
 
 예:
     python scripts/run_llm_worker.py
@@ -13,6 +19,7 @@ Gemini rate limit 역할을 한다.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -22,30 +29,18 @@ from google import genai
 from dart_pipeline import db
 from dart_pipeline.diff import order_filings, resolve_baselines
 from dart_pipeline.fast_path import process_filing_concurrent
-from dart_pipeline.strategy_shifts_ingest import refresh_strategy_shifts_for_company
+
+TIME_BUDGET_SECONDS = 50
 
 
-def main() -> int:
-    gemini = genai.Client()
-
-    with db.connection() as conn:
-        job = db.claim_next_job(conn)
-        # 이 블록이 끝나면 'running' 마킹이 바로 커밋된다(아래 LLM 처리는
-        # 별도 커넥션) — 처리 도중 워커가 죽으면 job은 'running'에 머무르며,
-        # db.claim_next_job()이 15분 넘은 'running' job을 방치된 것으로
-        # 보고 다시 집어가는 방식으로 복구한다.
-
-    if job is None:
-        print("대기 중인 job 없음")
-        return 0
-
+def _process_job(gemini: genai.Client, job: dict) -> bool:
+    """job 1건(회사 1곳의 밀린 filing 전체)을 처리하고 성공 여부를 반환한다."""
     corp_code = job["corp_code"]
     print(f"job #{job['id']} 처리 시작: corp_code={corp_code}")
 
     overview_cache: dict[str, dict] = {}
     all_ok = True
     detail = ""
-    processed_count = 0
 
     with db.connection() as conn:
         raw = db.filings_for_ai_insights(conn, corp_code)
@@ -80,7 +75,6 @@ def main() -> int:
             detail = result.detail
             break  # 이후 filing은 baseline이 끊겨 의미가 없으므로 중단
 
-        processed_count += 1
         with db.connection() as conn:
             overview_cache[rcept_no] = db.overview_for_filing(conn, rcept_no)
 
@@ -92,19 +86,34 @@ def main() -> int:
             db.mark_job_failed(conn, job["id"], detail)
             print(f"job #{job['id']} 실패: {detail}")
 
-    # strategyShifts는 filing 단위가 아니라 회사 전체 역사를 한 번에 보는
-    # 질문이라 여기서 한 번만 계산한다. 새로 처리한 filing이 없으면(이미
-    # 다 끝난 회사가 다시 큐에 올라온 경우) 다시 계산해도 결과가 같으므로
-    # Gemini 호출을 아낀다.
-    if all_ok and processed_count > 0:
-        try:
-            with db.connection() as conn:
-                n = refresh_strategy_shifts_for_company(conn, gemini, corp_code)
-            print(f"  전략 전환 감지: {n}건")
-        except Exception as e:  # 부가 기능 실패가 job 성공 여부를 바꾸지 않음
-            print(f"  전략 전환 감지 실패(무시): {e}")
+    return all_ok
 
-    return 0 if all_ok else 1
+
+def main() -> int:
+    gemini = genai.Client()
+    deadline = time.monotonic() + TIME_BUDGET_SECONDS
+    jobs_seen = 0
+    any_failed = False
+
+    while time.monotonic() < deadline:
+        with db.connection() as conn:
+            job = db.claim_next_job(conn)
+            # 이 블록이 끝나면 'running' 마킹이 바로 커밋된다(아래 LLM 처리는
+            # 별도 커넥션) — 처리 도중 워커가 죽으면 job은 'running'에 머무르며,
+            # db.claim_next_job()이 15분 넘은 'running' job을 방치된 것으로
+            # 보고 다시 집어가는 방식으로 복구한다.
+
+        if job is None:
+            break
+
+        jobs_seen += 1
+        if not _process_job(gemini, job):
+            any_failed = True
+
+    if jobs_seen == 0:
+        print("대기 중인 job 없음")
+
+    return 1 if any_failed else 0
 
 
 if __name__ == "__main__":

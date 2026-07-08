@@ -77,16 +77,22 @@ def mark_failed(conn, rcept_no: str, error_message: str) -> None:
         )
 
 
-def filings_missing_metrics(conn, corp_code: str) -> list[dict]:
-    """metrics가 아직 없는 해당 기업의 filings (rcept_no/bsns_year/reprt_code)."""
+def filings_missing_metrics(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """metrics가 아직 없는 해당 기업의 filings (rcept_no/bsns_year/reprt_code).
+
+    force=True면 이미 metrics가 있는 filings도 포함한다 — 스키마에 컬럼이
+    추가되는 등 전면 재적재가 필요할 때 사용(적재는 filing 단위
+    delete→insert라 멱등).
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT f.rcept_no, f.bsns_year, f.reprt_code
+            SELECT DISTINCT f.rcept_no, f.bsns_year, f.reprt_code
             FROM filings f
             LEFT JOIN metrics m ON m.rcept_no = f.rcept_no
-            WHERE f.corp_code = %s AND m.id IS NULL AND f.pipeline_status != 'FAILED'
-            """,
+            WHERE f.corp_code = %s AND f.pipeline_status != 'FAILED'
+            """
+            + ("" if force else " AND m.id IS NULL"),
             (corp_code,),
         )
         cols = [d[0] for d in cur.description]
@@ -107,9 +113,9 @@ def insert_metrics(conn, rows: list[dict]) -> int:
             """
             INSERT INTO metrics
               (rcept_no, corp_code, bsns_year, reprt_code, concept, account_nm,
-               statement_type, is_consolidated, period_qualifier, amount)
+               statement_type, ord, is_consolidated, period_qualifier, amount)
             VALUES (%(rcept_no)s, %(corp_code)s, %(bsns_year)s, %(reprt_code)s,
-                    %(concept)s, %(account_nm)s, %(statement_type)s,
+                    %(concept)s, %(account_nm)s, %(statement_type)s, %(ord)s,
                     %(is_consolidated)s, %(period_qualifier)s, %(amount)s)
             """,
             rows,
@@ -590,54 +596,17 @@ def update_overview_insights(conn, rcept_no: str, insight_by_key: dict, risks: l
         )
 
 
-def update_overview_strategy_shifts(conn, rcept_no: str, shifts: list[dict]) -> None:
-    """가장 최근 filing의 company_overview에 strategyShifts만 patch한다.
-
-    strategyShifts는 filing 단위가 아니라 회사 전체 역사를 봐야 하는 질문이라
-    한 회사당 한 번만 계산되고, 최신 filing의 개요에만 붙는다(다른 필드는
-    건드리지 않음)."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT overview_json FROM company_overview WHERE rcept_no = %s", (rcept_no,))
-        row = cur.fetchone()
-        if row is None:
-            return
-        overview = json.loads(row[0])
-        overview["strategyShifts"] = shifts
-        cur.execute(
-            "UPDATE company_overview SET overview_json = %s WHERE rcept_no = %s",
-            (json.dumps(overview, ensure_ascii=False), rcept_no),
-        )
-
-
-# ── LLM 처리 대기열 (일일 스캔이 채우고, 워커가 소비) ──────────────────────
+# ── LLM 처리 대기열 (darfin-main이 클릭 시 등록하고, 워커가 소비) ──────────
 # 작업 단위는 회사(corp_code) — summarize/findings/overview 오케스트레이션
 # 함수들이 이미 "이 회사의 밀린 filing을 전부 찾아서 처리" 방식이라 필링
-# 단위 추적이 필요 없다.
-
-def enqueue_llm_job(conn, corp_code: str, priority: int = 1) -> None:
-    """이미 pending/running인 job이 있으면 더 급한 쪽(작은 값)으로 우선순위만
-    올리고, 없으면 새로 추가한다. priority: 0=on_demand, 1=scheduled."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, priority FROM llm_jobs WHERE corp_code = %s AND status IN ('pending', 'running')",
-            (corp_code,),
-        )
-        existing = cur.fetchone()
-        if existing:
-            existing_id, existing_priority = existing
-            if priority < existing_priority:
-                cur.execute("UPDATE llm_jobs SET priority = %s WHERE id = %s", (priority, existing_id))
-            return
-        cur.execute(
-            "INSERT INTO llm_jobs (corp_code, priority) VALUES (%s, %s)",
-            (corp_code, priority),
-        )
+# 단위 추적이 필요 없다. 등록 경로가 on-demand 하나뿐이라 우선순위 개념은
+# 없음(단순 FIFO) — 등록은 darfin-main(CompanyAnalysisService.enqueueOnDemandJob)
+# 이 담당하고, 이 모듈은 claim/완료 처리만 한다.
 
 
 def claim_next_job(conn) -> dict | None:
-    """대기 중인 job 중 우선순위가 가장 급한(priority 작고 오래된) 1건을
-    잠그고(FOR UPDATE) 'running'으로 표시한다. 같은 트랜잭션 커밋 전까지
-    다른 워커가 같은 행을 못 집는다(row lock).
+    """대기 중인 job 중 가장 오래된 1건을 잠그고(FOR UPDATE) 'running'으로
+    표시한다. 같은 트랜잭션 커밋 전까지 다른 워커가 같은 행을 못 집는다(row lock).
 
     'running'으로 바뀐 뒤 워커가 죽으면(LLM 처리 중 크래시 등) 그 job은
     영영 'running'에 머무를 수 있다 — claim 자체는 짧게 커밋되고 그 뒤의
@@ -648,7 +617,7 @@ def claim_next_job(conn) -> dict | None:
             "SELECT id, corp_code FROM llm_jobs "
             "WHERE status = 'pending' "
             "   OR (status = 'running' AND started_at < NOW() - INTERVAL 15 MINUTE) "
-            "ORDER BY priority ASC, requested_at ASC LIMIT 1 FOR UPDATE"
+            "ORDER BY requested_at ASC LIMIT 1 FOR UPDATE"
         )
         row = cur.fetchone()
         if row is None:

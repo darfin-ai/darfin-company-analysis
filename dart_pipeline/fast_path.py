@@ -102,7 +102,9 @@ def process_filing_concurrent(
                 products = extract_products(chunks)
                 regions = extract_regions(chunks, baseline_regions)
                 shareholders = extract_shareholders(chunks)
-                dividend = extract_dividend(dividend_chunk)
+                dividend = extract_dividend(
+                    dividend_chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                )
             else:
                 segments = existing_overview["segments"]
                 products = existing_overview["products"]

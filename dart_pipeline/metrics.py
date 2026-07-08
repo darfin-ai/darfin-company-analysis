@@ -18,6 +18,14 @@ _STATEMENT_LABELS = {
 _NO_STANDARD_CODE = "-표준계정코드 미사용-"
 
 
+def _parse_ord(text: str | None) -> int | None:
+    """재무제표 내 계정 나열 순서. 공시 원문 표 순서 그대로라 정렬 축으로 쓴다."""
+    try:
+        return int(text) if text else None
+    except ValueError:
+        return None
+
+
 def _parse_amount(text: str | None) -> int | None:
     if not text:
         return None
@@ -65,6 +73,7 @@ def transform(
             "concept": concept,
             "account_nm": account_nm,
             "statement_type": statement_type,
+            "ord": _parse_ord(item.get("ord")),
             "is_consolidated": is_consolidated,
         }
 

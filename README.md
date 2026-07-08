@@ -1,88 +1,77 @@
-﻿# DART 공시 분석 및 요약 API 서버 (FastAPI & Gemini)
+# darfin-company-analysis
 
-이 프로젝트는 DART (금융감독원 전자공시시스템) API를 통해 받은 기업 공시 원문을 **Gemini 2.5 Flash** 모델로 분석하고 핵심 내용을 요약하는 FastAPI 기반의 백엔드 서버입니다.
+DART 정기공시(사업/반기/분기보고서) 기반 기업분석 파이프라인 워커입니다. DART Open API로 공시를 수집하고, XML을 파싱해 비교(diff)한 뒤 Gemini로 요약해 MySQL에 기록합니다. 조회 API는 별도 저장소 `darfin-main`(Spring)이 담당하며, 이 저장소는 HTTP 서버를 띄우지 않습니다 — 두 저장소는 MySQL을 통해서만 연결됩니다.
+
+파이프라인 단계, 저장 전략, 구현 순서는 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)에 정리되어 있습니다. 작업 전 먼저 읽어주세요.
 
 ---
 
 ## 🛠️ 개발 환경
 
-- **Language:** Python 3.13.9
 - **Language:** Python 3.11+
-- **Framework:** FastAPI
 - **AI Model:** Gemini 2.5 Flash (via `google-genai` SDK)
+- **DB:** MySQL/MariaDB (스키마는 `darfin-main/ddl.sql`)
 
 ---
 
 ## 🚀 시작 가이드
 
-### 1. 프로젝트 복제
-```bash
-git clone https://your-repository-url.git
-cd darfin-company-analysis
-```
+### 1. 가상환경 생성 및 의존성 설치
 
-### 2. 가상환경 생성 및 활성화
-
-프로젝트의 독립적인 실행 환경을 위해 가상환경을 설정합니다.
-
-**Windows:**
 ```bash
 python -m venv venv
-venv\Scripts\activate
-```
-
-**macOS / Linux:**
-```bash
-python -m venv venv
-source venv/bin/activate
-```
-
-### 3. 필수 라이브러리 설치
-
-`requirements.txt` 파일에 명시된 의존성 패키지를 설치합니다.
-```bash
+source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. 환경 변수 설정
+### 2. 환경 변수 설정
 
-프로젝트 루트 디렉터리에 `.env` 파일을 생성하고, Google AI Studio에서 발급받은 API 키를 추가합니다.
+프로젝트 루트에 `.env` 파일을 생성합니다.
 
 ```ini
 # .env
 GEMINI_API_KEY=your_actual_gemini_api_key_here
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_USER=...
+DB_PASSWORD=...
+DB_NAME=darfin_dev
 ```
-> ⚠️ **주의**: `.env` 파일은 API 키와 같은 민감한 정보를 포함하므로, `.gitignore`에 추가하여 Git 저장소에 업로드되지 않도록 주의하세요.
+
+> ⚠️ `.env`는 API 키 등 민감 정보를 포함하므로 절대 커밋하지 마세요(`.gitignore`에 이미 포함).
 
 ---
 
-## 🏃 서버 실행 및 테스트
+## 🏃 파이프라인 실행
 
-### 1. 서버 실행
+이 저장소는 서버를 실행하는 게 아니라 CLI 스크립트를 순서대로(또는 cron으로) 실행합니다. 각 스크립트는 `--stock <종목코드>`로 특정 회사만 대상으로 실행할 수 있습니다.
 
-Uvicorn을 사용하여 FastAPI 서버를 실행합니다. `--reload` 옵션을 사용하면 코드 변경 시 서버가 자동으로 재시작됩니다.
 ```bash
-uvicorn main:app --reload
+python scripts/ingest_filings.py --stock 005930     # 1. DART 수집 (RAW)
+python scripts/parse_filings.py --stock 005930      # 2. XML 파싱 (PARSED)
+python scripts/fetch_metrics.py --stock 005930      # 재무 수치 적재
+python scripts/diff_filings.py --stock 005930       # 3. 비교(diff)
+python scripts/build_overview.py --stock 005930     # company_overview 결정론적 부분
+python scripts/extract_findings.py --stock 005930   # findings + score_history (LLM)
 ```
-서버가 시작되면 브라우저에서 `http://127.0.0.1:8000` 주소로 접속할 수 있습니다.
 
-### 2. API 테스트
+운영 환경에서는 두 개의 cron 작업이 이를 대체합니다:
 
-FastAPI가 자동으로 생성해주는 Swagger UI 문서를 통해 API를 직접 테스트할 수 있습니다.
+- `scripts/run_daily_scan.py` — 하루 1회, 커버 대상 전체에 대해 수집~diff~결정론적 overview까지(Gemini 호출 없음).
+- `scripts/run_llm_worker.py` — 1분마다, `llm_jobs` 대기열(사용자가 `darfin-main`에서 회사 상세를 조회할 때만 등록되는 on-demand 큐)을 큐가 빌 때까지 소비하며 findings/risks/insights를 Gemini로 생성.
 
-혹은 postman과 같은 API 클라이언트를 사용하여 `/api/analyze` 엔드포인트를 호출할 수도 있습니다.
-
-1.  `http://127.0.0.1:8000/docs` 로 접속합니다.
-2.  `/api/analyze` 엔드포인트를 선택하고 `Try it out`을 클릭합니다.
-3.  `raw_text` 필드에 분석할 DART 공시 원문을 입력합니다.
-4.  `Execute` 버튼을 눌러 분석 결과를 확인합니다.
+자세한 트리거 조건과 상태 머신은 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)를 참고하세요.
 
 ---
 
 ## 📂 프로젝트 구조
+
 ```
-├── main.py             # FastAPI 애플리케이션 및 Gemini 연동 소스 코드
-├── .env                # API 키 등 환경변수 관리 파일 (보안 주의)
-├── requirements.txt    # 설치 패키지 목록 정의 파일
-└── README.md           # 프로젝트 가이드 문서 (현재 파일)
+├── dart_pipeline/      # 파이프라인 각 단계(수집/파싱/diff/LLM) 로직
+├── dart_parser/        # DART XML → 구조화 데이터 파서
+├── scripts/            # CLI 진입점 (수동 실행 + cron 대상)
+├── data/                # DART 원본 XML/ZIP 캐시 (gitignore)
+├── requirements.txt
+└── IMPLEMENTATION_PLAN.md  # 설계 문서 (항상 최신 상태로 갱신)
+```
