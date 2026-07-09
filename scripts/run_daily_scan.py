@@ -30,6 +30,7 @@ from dart_pipeline.diff_ingest import diff_filings_for_stock
 from dart_pipeline.metrics_ingest import fetch_metrics_for_stock
 from dart_pipeline.overview_ingest import build_deterministic_overview_for_stock
 from dart_pipeline.parse_ingest import parse_filings_for_stock
+from dart_pipeline.report_facts_ingest import QuotaExceededError, fetch_report_facts_for_stock
 
 
 def _covered_corp_codes(conn) -> list[str]:
@@ -66,6 +67,11 @@ def main() -> int:
             ingest_company(client, stock_code, bgn_de, end_de)
             parse_filings_for_stock(client, stock_code)
             fetch_metrics_for_stock(client, stock_code)
+            try:
+                fetch_report_facts_for_stock(client, stock_code)
+            except QuotaExceededError as e:
+                print(f"{stock_code}({corp_code}): report_facts 쿼터 초과 — {e}")
+                continue
             diff_filings_for_stock(client, stock_code)
             # 결정론적 부분(segments/products/regions/shareholders/dividend)은
             # LLM이 전혀 없어 여기서 바로 채운다 — 클릭을 기다릴 필요 없음.

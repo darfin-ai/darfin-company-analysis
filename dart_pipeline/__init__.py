@@ -5,6 +5,13 @@
 """
 
 from .client import DartApiError, DartClient
-from .ingest import ingest_company
 
 __all__ = ["DartClient", "DartApiError", "ingest_company"]
+
+
+def __getattr__(name: str):
+    if name == "ingest_company":
+        from .ingest import ingest_company
+
+        return ingest_company
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

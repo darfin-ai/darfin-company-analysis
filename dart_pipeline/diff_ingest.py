@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from . import db
 from .client import DartClient
 from .corp_codes import load_corp_codes
-from .diff import diff_pair, order_filings, resolve_baselines
+from .diff import diff_pair, headcount_metrics, order_filings, ownership_metrics, resolve_baselines
+from .report_facts_resolve import facts_ready, resolve_headcount, resolve_ownership
 
 
 @dataclass
@@ -72,6 +73,19 @@ def diff_filings_for_stock(client: DartClient, stock_code: str, force: bool = Fa
                 rows = []
                 for comparison_type, baseline in usable.items():
                     base_chunks, base_metrics = load(baseline["rcept_no"])
+                    base_year, base_reprt = baseline["bsns_year"], baseline["reprt_code"]
+
+                    use_api_hc = facts_ready(
+                        conn, corp.corp_code, bsns_year, reprt_code, "empSttus", "exctvSttus"
+                    ) and facts_ready(
+                        conn, corp.corp_code, base_year, base_reprt, "empSttus", "exctvSttus"
+                    )
+                    use_api_own = facts_ready(
+                        conn, corp.corp_code, bsns_year, reprt_code, "hyslrSttus", "mrhlSttus"
+                    ) and facts_ready(
+                        conn, corp.corp_code, base_year, base_reprt, "hyslrSttus", "mrhlSttus"
+                    )
+
                     entries = diff_pair(
                         rcept_no=rcept_no,
                         reprt_code=reprt_code,
@@ -81,6 +95,54 @@ def diff_filings_for_stock(client: DartClient, stock_code: str, force: bool = Fa
                         base_chunks=base_chunks,
                         cur_metrics=cur_metrics,
                         base_metrics=base_metrics,
+                        cur_headcount=(
+                            resolve_headcount(
+                                conn,
+                                corp.corp_code,
+                                bsns_year,
+                                reprt_code,
+                                cur_chunks,
+                                headcount_metrics,
+                            )
+                            if use_api_hc
+                            else None
+                        ),
+                        base_headcount=(
+                            resolve_headcount(
+                                conn,
+                                corp.corp_code,
+                                base_year,
+                                base_reprt,
+                                base_chunks,
+                                headcount_metrics,
+                            )
+                            if use_api_hc
+                            else None
+                        ),
+                        cur_ownership=(
+                            resolve_ownership(
+                                conn,
+                                corp.corp_code,
+                                bsns_year,
+                                reprt_code,
+                                cur_chunks,
+                                ownership_metrics,
+                            )
+                            if use_api_own
+                            else None
+                        ),
+                        base_ownership=(
+                            resolve_ownership(
+                                conn,
+                                corp.corp_code,
+                                base_year,
+                                base_reprt,
+                                base_chunks,
+                                ownership_metrics,
+                            )
+                            if use_api_own
+                            else None
+                        ),
                     )
                     for e in entries:
                         e["rcept_no"] = rcept_no

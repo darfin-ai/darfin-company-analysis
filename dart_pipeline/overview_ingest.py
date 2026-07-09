@@ -32,6 +32,7 @@ from .overview import (
     extract_segments,
     extract_shareholders,
 )
+from .report_facts_resolve import resolve_dividend, resolve_shareholders
 from .scoring import quarter_label
 
 _RISK_EXCERPT_MAX = 500
@@ -174,9 +175,23 @@ def build_deterministic_overview_for_stock(
                 segments = compute_segment_status(extract_segments(chunks), baseline_segments)
                 products = extract_products(chunks)
                 regions = extract_regions(chunks, baseline_regions)
-                shareholders = extract_shareholders(chunks)
-                dividend = extract_dividend(
-                    dividend_chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                shareholders = resolve_shareholders(
+                    conn,
+                    corp.corp_code,
+                    bsns_year,
+                    reprt_code,
+                    chunks,
+                    extract_shareholders,
+                )
+                dividend = resolve_dividend(
+                    conn,
+                    corp.corp_code,
+                    bsns_year,
+                    reprt_code,
+                    dividend_chunk,
+                    lambda chunk: extract_dividend(
+                        chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                    ),
                 )
                 mdna_entry = build_mdna_entry(
                     rcept_no, bsns_year, reprt_code, quarter_label(bsns_year, reprt_code),
@@ -279,9 +294,23 @@ def build_overview_for_stock(
                 segments = compute_segment_status(extract_segments(chunks), baseline_segments)
                 products = extract_products(chunks)
                 regions = extract_regions(chunks, baseline_regions)
-                shareholders = extract_shareholders(chunks)
-                dividend = extract_dividend(
-                    dividend_chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                shareholders = resolve_shareholders(
+                    conn,
+                    corp.corp_code,
+                    bsns_year,
+                    reprt_code,
+                    chunks,
+                    extract_shareholders,
+                )
+                dividend = resolve_dividend(
+                    conn,
+                    corp.corp_code,
+                    bsns_year,
+                    reprt_code,
+                    dividend_chunk,
+                    lambda chunk: extract_dividend(
+                        chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                    ),
                 )
                 risks = _build_risks(gemini, rcept_no, risk_chunks, baseline_overview)
                 mdna_entry = build_mdna_entry(

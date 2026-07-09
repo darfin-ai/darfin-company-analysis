@@ -1,0 +1,16 @@
+[
+  {
+    "rcept_no": "20250311001085",
+    "corp_cls": "Y",
+    "corp_code": "00126380",
+    "corp_name": "삼성전자",
+    "se": "소액주주",
+    "shrholdr_co": "5,160,210",
+    "shrholdr_tot_co": "5,160,297",
+    "shrholdr_rate": "99.99%",
+    "hold_stock_co": "4,073,349,914",
+    "stock_tot_co": "5,969,782,550",
+    "hold_stock_rate": "68.23%",
+    "stlm_dt": "2024-12-31"
+  }
+]

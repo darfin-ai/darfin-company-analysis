@@ -1,9 +1,11 @@
 """DART Open API 클라이언트.
 
-사용 엔드포인트 3개:
+사용 엔드포인트:
   - corpCode.xml : 전체 기업 고유번호 매핑 (zip)
   - list.json    : 공시 목록 검색 (신규 공시 발견)
   - document.xml : 공시 원본 파일 다운로드 (zip)
+  - fnlttSinglAcntAll.json : 재무제표 수치
+  - report_api() : 정기보고서 주요정보 10종 (alotMatter, hyslrSttus, …)
 
 일일 쿼터 20,000건 — 호출 사이에 짧은 지연을 두고, 일시 오류는 재시도한다.
 파일 엔드포인트의 오류 응답은 zip이 아니라 XML로 오므로 매직 바이트(PK)로 구분.
@@ -119,6 +121,27 @@ class DartClient:
     def corp_codes_zip(self) -> bytes:
         """전체 기업 고유번호 파일 (zip 안에 CORPCODE.xml)."""
         return self._get_zip("corpCode.xml")
+
+    def report_api(
+        self, api_id: str, corp_code: str, bsns_year: str, reprt_code: str
+    ) -> list[dict] | None:
+        """정기보고서 주요정보 API 공통 호출 (alotMatter, hyslrSttus, empSttus 등).
+
+        status 000 → list, 013(무자료) → None, 그 외(020 쿼터 포함) → DartApiError.
+        """
+        data = self._get(
+            f"{api_id}.json",
+            corp_code=corp_code,
+            bsns_year=bsns_year,
+            reprt_code=reprt_code,
+        ).json()
+
+        status = data.get("status")
+        if status == _NO_DATA:
+            return None
+        if status != "000":
+            raise DartApiError(status, data.get("message", _STATUS_MESSAGES.get(status, "")))
+        return data.get("list", [])
 
     def fnltt_singl_acnt_all(
         self, corp_code: str, bsns_year: str, reprt_code: str, fs_div: str

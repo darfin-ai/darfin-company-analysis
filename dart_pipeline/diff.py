@@ -526,6 +526,10 @@ def diff_pair(
     base_chunks: list[dict],
     cur_metrics: list[dict],
     base_metrics: list[dict],
+    cur_headcount: dict[str, float] | None = None,
+    base_headcount: dict[str, float] | None = None,
+    cur_ownership: dict[str, float] | None = None,
+    base_ownership: dict[str, float] | None = None,
 ) -> list[dict]:
     """공시 한 쌍의 전체 섹션 diff. section_diffs 삽입용 행(부분) 목록을 돌려준다."""
     cur_by_label: dict[str, list[dict]] = {}
@@ -562,9 +566,9 @@ def diff_pair(
                     )
                 )
         elif analysis_type == "headcount":
-            metrics = _count_metrics(
-                headcount_metrics(cur_secs), headcount_metrics(base_secs), "count", "명"
-            )
+            cur_hc = cur_headcount if cur_headcount is not None else headcount_metrics(cur_secs)
+            base_hc = base_headcount if base_headcount is not None else headcount_metrics(base_secs)
+            metrics = _count_metrics(cur_hc, base_hc, "count", "명")
             if metrics:
                 entries.append(
                     _entry(
@@ -574,9 +578,9 @@ def diff_pair(
                     )
                 )
         elif analysis_type == "ownership":
-            metrics = _count_metrics(
-                ownership_metrics(cur_secs), ownership_metrics(base_secs), "%", None
-            )
+            cur_own = cur_ownership if cur_ownership is not None else ownership_metrics(cur_secs)
+            base_own = base_ownership if base_ownership is not None else ownership_metrics(base_secs)
+            metrics = _count_metrics(cur_own, base_own, "%", None)
             if metrics:
                 entries.append(
                     _entry(

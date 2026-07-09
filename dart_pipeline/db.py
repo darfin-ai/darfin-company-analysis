@@ -123,6 +123,239 @@ def insert_metrics(conn, rows: list[dict]) -> int:
     return len(rows)
 
 
+# ── DART 정기보고서 주요정보 API 캐시 (report_facts) ─────────────────────
+
+
+def filing_periods(conn, corp_code: str) -> list[dict]:
+    """기업 filings에서 distinct (bsns_year, reprt_code) 목록."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT bsns_year, reprt_code
+            FROM filings
+            WHERE corp_code = %s AND pipeline_status != 'FAILED'
+            ORDER BY bsns_year, reprt_code
+            """,
+            (corp_code,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def report_fact_exists(
+    conn, corp_code: str, bsns_year: str, reprt_code: str, api_id: str
+) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM report_facts
+            WHERE corp_code = %s AND bsns_year = %s AND reprt_code = %s AND api_id = %s
+            """,
+            (corp_code, bsns_year, reprt_code, api_id),
+        )
+        return cur.fetchone() is not None
+
+
+def report_fact_payload(
+    conn, corp_code: str, bsns_year: str, reprt_code: str, api_id: str
+) -> list[dict] | None:
+    """저장된 API rows. 행 없으면 KeyError, 013 캐시면 None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload_json FROM report_facts
+            WHERE corp_code = %s AND bsns_year = %s AND reprt_code = %s AND api_id = %s
+            """,
+            (corp_code, bsns_year, reprt_code, api_id),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise KeyError(f"report_facts missing: {corp_code}/{bsns_year}/{reprt_code}/{api_id}")
+    if row[0] is None:
+        return None
+    return json.loads(row[0])
+
+
+def report_facts_missing(
+    conn,
+    corp_code: str,
+    api_ids: list[str],
+    force: bool = False,
+) -> list[dict]:
+    """아직 fetch하지 않은 (bsns_year, reprt_code, api_id) 조합."""
+    periods = filing_periods(conn, corp_code)
+    missing: list[dict] = []
+    for period in periods:
+        bsns_year, reprt_code = period["bsns_year"], period["reprt_code"]
+        for api_id in api_ids:
+            if force or not report_fact_exists(conn, corp_code, bsns_year, reprt_code, api_id):
+                missing.append(
+                    {"bsns_year": bsns_year, "reprt_code": reprt_code, "api_id": api_id}
+                )
+    return missing
+
+
+def latest_filing_period(conn, corp_code: str) -> dict | None:
+    """최신 비실패 filing의 (bsns_year, reprt_code, rcept_no). 없으면 None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT rcept_no, bsns_year, reprt_code
+            FROM filings
+            WHERE corp_code = %s AND pipeline_status != 'FAILED'
+            ORDER BY filed_date DESC
+            LIMIT 1
+            """,
+            (corp_code,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {"rcept_no": row[0], "bsns_year": row[1], "reprt_code": row[2]}
+
+
+def report_facts_for_period(
+    conn, corp_code: str, bsns_year: str, reprt_code: str
+) -> dict[str, dict | None]:
+    """api_id → {payload, rcept_no, fetched_at}. payload None = 013 negative cache."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT api_id, payload_json, rcept_no, fetched_at
+            FROM report_facts
+            WHERE corp_code = %s AND bsns_year = %s AND reprt_code = %s
+            """,
+            (corp_code, bsns_year, reprt_code),
+        )
+        out: dict[str, dict | None] = {}
+        for api_id, payload_json, rcept_no, fetched_at in cur.fetchall():
+            payload = None if payload_json is None else json.loads(payload_json)
+            out[api_id] = {
+                "payload": payload,
+                "rcept_no": rcept_no,
+                "fetched_at": fetched_at,
+            }
+        return out
+
+
+def report_facts_needing_refresh(
+    conn,
+    corp_code: str,
+    bsns_year: str,
+    reprt_code: str,
+    api_ids: list[str],
+    *,
+    current_rcept_no: str | None = None,
+    negative_retry_hours: int = 24,
+    force: bool = False,
+) -> list[str]:
+    """재수집 대상 api_id 목록 — 접수번호(rcept_no) 기반 이벤트 방식.
+
+    행이 없으면 stale. 있으면 저장된 rcept_no가 현재 최신 정기공시 접수번호와
+    다를 때만 stale (신규 보고서·정정공시 = 새 rcept_no). 예외: 무자료(013)
+    negative cache는 공시 직후 DART 상세 API 반영 지연이 있어 negative_retry_hours
+    경과 시 재시도. current_rcept_no=None(list.json 실패로 기간 미검증)이면
+    기존 행은 신선한 것으로 간주하고 캐시를 그대로 서빙한다.
+    """
+    if force:
+        return list(api_ids)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT api_id, rcept_no, payload_json IS NULL,
+                   fetched_at < NOW() - INTERVAL %s HOUR
+            FROM report_facts
+            WHERE corp_code = %s AND bsns_year = %s AND reprt_code = %s
+            """,
+            (negative_retry_hours, corp_code, bsns_year, reprt_code),
+        )
+        rows = {r[0]: r[1:] for r in cur.fetchall()}
+    stale: list[str] = []
+    for api_id in api_ids:
+        row = rows.get(api_id)
+        if row is None:
+            stale.append(api_id)
+            continue
+        if current_rcept_no is None:
+            continue
+        row_rcept_no, is_no_data, past_retry_window = row
+        if row_rcept_no != current_rcept_no:
+            stale.append(api_id)
+        elif is_no_data and past_retry_window:
+            stale.append(api_id)
+    return stale
+
+
+def upsert_report_fact(
+    conn,
+    *,
+    corp_code: str,
+    bsns_year: str,
+    reprt_code: str,
+    api_id: str,
+    payload: list[dict] | None,
+    rcept_no: str | None = None,
+) -> None:
+    """payload=None이면 013 negative cache. rcept_no는 수집 시점의 최신 접수번호."""
+    payload_json = None if payload is None else json.dumps(payload, ensure_ascii=False)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO report_facts (corp_code, bsns_year, reprt_code, api_id, rcept_no, payload_json)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+              rcept_no = VALUES(rcept_no),
+              payload_json = VALUES(payload_json),
+              fetched_at = CURRENT_TIMESTAMP
+            """,
+            (corp_code, bsns_year, reprt_code, api_id, rcept_no, payload_json),
+        )
+
+
+def delete_report_facts_other_periods(
+    conn, corp_code: str, bsns_year: str, reprt_code: str
+) -> int:
+    """회사당 최신 기간만 유지 — dartOverview용 report_facts에서 이전 기간 행 삭제."""
+    with conn.cursor() as cur:
+        return cur.execute(
+            """
+            DELETE FROM report_facts
+            WHERE corp_code = %s AND (bsns_year != %s OR reprt_code != %s)
+            """,
+            (corp_code, bsns_year, reprt_code),
+        )
+
+
+def delete_report_facts_outside_periods(
+    conn, corp_code: str, keep_periods: list[tuple[str, str]]
+) -> int:
+    """list.json lookback 창 안의 기간만 유지 — RT fallback용 이력 보존 버전.
+
+    delete_report_facts_other_periods(배치용, 최신 1기간만 유지)와 달리
+    dartOverview RT 흐름은 최근 정기공시 여러 건(분기/반기/사업)을 캐시에
+    남겨 과거 기간 fallback 조회 시 재조회 없이 쓸 수 있게 한다.
+    """
+    if not keep_periods:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT bsns_year, reprt_code FROM report_facts WHERE corp_code = %s",
+            (corp_code,),
+        )
+        existing = {(r[0], r[1]) for r in cur.fetchall()}
+        to_delete = existing - set(keep_periods)
+        deleted = 0
+        for bsns_year, reprt_code in to_delete:
+            deleted += cur.execute(
+                """
+                DELETE FROM report_facts
+                WHERE corp_code = %s AND bsns_year = %s AND reprt_code = %s
+                """,
+                (corp_code, bsns_year, reprt_code),
+            )
+        return deleted
+
+
 def filings_for_parsing(conn, corp_code: str, force: bool = False) -> list[dict]:
     """파싱(text_chunks 적재) 대상 filings. force 없으면 아직 RAW인 것만 (재실행 시 이미
     PARSED된 것도 다시 돌리려면 force=True — 파서 개선 후 재처리에 사용)."""

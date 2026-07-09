@@ -1,0 +1,16 @@
+[
+  {
+    "rcept_no": "20250319000665",
+    "corp_cls": "Y",
+    "corp_code": "00164779",
+    "corp_name": "SK하이닉스",
+    "se": "소액주주",
+    "shrholdr_co": "780,867",
+    "shrholdr_tot_co": "780,876",
+    "shrholdr_rate": "99.99%",
+    "hold_stock_co": "456,814,819",
+    "stock_tot_co": "728,002,365",
+    "hold_stock_rate": "62.74%",
+    "stlm_dt": "2024-12-31"
+  }
+]

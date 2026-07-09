@@ -48,6 +48,7 @@ from .overview import (
     extract_shareholders,
 )
 from .overview_ingest import _norm_title, _risk_evidence
+from .report_facts_resolve import resolve_dividend, resolve_shareholders
 from .scoring import Finding, compute_scores, quarter_label
 
 
@@ -101,9 +102,23 @@ def process_filing_concurrent(
                 segments = compute_segment_status(extract_segments(chunks), baseline_segments)
                 products = extract_products(chunks)
                 regions = extract_regions(chunks, baseline_regions)
-                shareholders = extract_shareholders(chunks)
-                dividend = extract_dividend(
-                    dividend_chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                shareholders = resolve_shareholders(
+                    conn,
+                    corp_code,
+                    bsns_year,
+                    reprt_code,
+                    chunks,
+                    extract_shareholders,
+                )
+                dividend = resolve_dividend(
+                    conn,
+                    corp_code,
+                    bsns_year,
+                    reprt_code,
+                    dividend_chunk,
+                    lambda chunk: extract_dividend(
+                        chunk, bsns_year=bsns_year, reprt_code=reprt_code
+                    ),
                 )
             else:
                 segments = existing_overview["segments"]
