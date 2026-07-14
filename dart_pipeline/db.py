@@ -77,50 +77,94 @@ def mark_failed(conn, rcept_no: str, error_message: str) -> None:
         )
 
 
-def filings_missing_metrics(conn, corp_code: str, force: bool = False) -> list[dict]:
-    """metrics가 아직 없는 해당 기업의 filings (rcept_no/bsns_year/reprt_code).
+# ── DART 재무제표 원본 캐시 (financial_facts) ────────────────────────────
+# darfin-main의 FinancialFactDao와 같은 테이블을 같은 upsert 의미론으로 쓴다
+# (report_facts와 동일한 dual-writer 관례). 서빙(재무 추이 API)은 전적으로
+# darfin-main 몫이고, 파이프라인은 (a) 온보딩/일일 스캔 시 캐시를 미리 덥히고
+# (b) diff의 수치형 입력으로 읽기만 한다.
 
-    force=True면 이미 metrics가 있는 filings도 포함한다 — 스키마에 컬럼이
-    추가되는 등 전면 재적재가 필요할 때 사용(적재는 filing 단위
-    delete→insert라 멱등).
+
+def filings_missing_financial_facts(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """financial_facts가 아직 없거나 낡은(정정공시로 rcept_no가 바뀐) 해당 기업의
+    filings (rcept_no/bsns_year/reprt_code). 같은 (연도, 보고서)에 정정공시가
+    여러 건이면 filed_date 최신 filing만 대상으로 삼는다.
+
+    force=True면 이미 캐시된 기간도 포함한다 — 전면 재적재용.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT DISTINCT f.rcept_no, f.bsns_year, f.reprt_code
+            SELECT f.rcept_no, f.bsns_year, f.reprt_code
             FROM filings f
-            LEFT JOIN metrics m ON m.rcept_no = f.rcept_no
+            JOIN (
+              SELECT bsns_year, reprt_code, MAX(filed_date) AS max_filed
+              FROM filings
+              WHERE corp_code = %s AND pipeline_status != 'FAILED'
+              GROUP BY bsns_year, reprt_code
+            ) latest ON latest.bsns_year = f.bsns_year
+                    AND latest.reprt_code = f.reprt_code
+                    AND latest.max_filed = f.filed_date
             WHERE f.corp_code = %s AND f.pipeline_status != 'FAILED'
             """
-            + ("" if force else " AND m.id IS NULL"),
-            (corp_code,),
+            + (
+                ""
+                if force
+                else """
+              AND 2 > (
+                SELECT COUNT(*) FROM financial_facts ff
+                WHERE ff.corp_code = f.corp_code
+                  AND ff.bsns_year = f.bsns_year
+                  AND ff.reprt_code = f.reprt_code
+                  AND ff.rcept_no = f.rcept_no
+              )
+            """
+            ),
+            (corp_code, corp_code),
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def delete_metrics(conn, rcept_no: str) -> None:
-    """재실행 멱등성: 새로 채우기 전에 해당 공시의 기존 metrics를 지운다."""
+def upsert_financial_fact(
+    conn,
+    *,
+    corp_code: str,
+    bsns_year: str,
+    reprt_code: str,
+    fs_div: str,
+    rcept_no: str | None,
+    payload: list[dict] | None,
+) -> None:
+    """payload=None이면 013 무자료 negative cache — darfin-main
+    FinancialFactDao.upsertFinancialFact와 컬럼·의미 동일."""
+    payload_json = None if payload is None else json.dumps(payload, ensure_ascii=False)
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM metrics WHERE rcept_no = %s", (rcept_no,))
-
-
-def insert_metrics(conn, rows: list[dict]) -> int:
-    if not rows:
-        return 0
-    with conn.cursor() as cur:
-        cur.executemany(
+        cur.execute(
             """
-            INSERT INTO metrics
-              (rcept_no, corp_code, bsns_year, reprt_code, concept, account_nm,
-               statement_type, ord, is_consolidated, period_qualifier, amount)
-            VALUES (%(rcept_no)s, %(corp_code)s, %(bsns_year)s, %(reprt_code)s,
-                    %(concept)s, %(account_nm)s, %(statement_type)s, %(ord)s,
-                    %(is_consolidated)s, %(period_qualifier)s, %(amount)s)
+            INSERT INTO financial_facts (corp_code, bsns_year, reprt_code, fs_div, rcept_no, payload_json)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+              rcept_no = VALUES(rcept_no),
+              payload_json = VALUES(payload_json),
+              fetched_at = CURRENT_TIMESTAMP
             """,
-            rows,
+            (corp_code, bsns_year, reprt_code, fs_div, rcept_no, payload_json),
         )
-    return len(rows)
+
+
+def financial_fact_payloads(conn, corp_code: str, bsns_year: str, reprt_code: str) -> dict[str, list[dict] | None]:
+    """fs_div(CFS/OFS) → 저장된 fnlttSinglAcntAll 원본 rows. 캐시 없으면 키 없음,
+    negative cache면 None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT fs_div, payload_json FROM financial_facts
+            WHERE corp_code = %s AND bsns_year = %s AND reprt_code = %s
+            """,
+            (corp_code, bsns_year, reprt_code),
+        )
+        rows = cur.fetchall()
+    return {fs_div: (None if payload_json is None else json.loads(payload_json)) for fs_div, payload_json in rows}
 
 
 # ── DART 정기보고서 주요정보 API 캐시 (report_facts) ─────────────────────
@@ -336,21 +380,6 @@ def load_chunks(conn, rcept_no: str) -> list[dict]:
             SELECT section_title, canonical_label, assoc_note, atocid, breadcrumb,
                    section_level, section_order, content, tables_json, content_hash
             FROM text_chunks WHERE rcept_no = %s ORDER BY section_order
-            """,
-            (rcept_no,),
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def load_metrics(conn, rcept_no: str) -> list[dict]:
-    """한 공시의 metrics 전체 (수치형 diff 입력)."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT concept, account_nm, statement_type, is_consolidated,
-                   period_qualifier, amount
-            FROM metrics WHERE rcept_no = %s
             """,
             (rcept_no,),
         )
@@ -745,20 +774,23 @@ def claim_next_job(conn) -> dict | None:
     그래서 15분 넘게 'running'인 job은 방치된 것으로 보고 다시 집는다."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, corp_code FROM llm_jobs "
+            "SELECT id, corp_code, job_type FROM llm_jobs "
             "WHERE status = 'pending' "
             "   OR (status = 'running' AND started_at < NOW() - INTERVAL 15 MINUTE) "
-            "ORDER BY requested_at ASC LIMIT 1 FOR UPDATE"
+            # onboard_ingest 우선 — 이게 끝나야 그 회사의 개요/AI분석 나머지가
+            # 전부 풀리므로(preview 탈출), 큐에 다른 job이 쌓여 있어도 새로
+            # 관심등록된 회사가 뒤로 밀리지 않게 한다.
+            "ORDER BY (job_type = 'onboard_ingest') DESC, requested_at ASC LIMIT 1 FOR UPDATE"
         )
         row = cur.fetchone()
         if row is None:
             return None
-        job_id, corp_code = row
+        job_id, corp_code, job_type = row
         cur.execute(
             "UPDATE llm_jobs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = %s",
             (job_id,),
         )
-    return {"id": job_id, "corp_code": corp_code}
+    return {"id": job_id, "corp_code": corp_code, "job_type": job_type}
 
 
 def mark_job_done(conn, job_id: int) -> None:
@@ -774,4 +806,147 @@ def mark_job_failed(conn, job_id: int, error_message: str) -> None:
         cur.execute(
             "UPDATE llm_jobs SET status = 'failed', completed_at = CURRENT_TIMESTAMP, error_message = %s WHERE id = %s",
             (error_message[:300], job_id),
+        )
+
+
+# ---------------------------------------------------------------------------
+# AI분석 리스크 텍스트 레이어 (job_type='risk_analysis' — ddl.sql §8)
+# ---------------------------------------------------------------------------
+
+def filings_for_risk_extraction(conn, corp_code: str, force: bool = False) -> list[dict]:
+    """text_extractions가 아직 없는 PARSED 이상 filings, 시간순. 정정공시로
+    같은 (연도, 보고서)가 중복이면 filed_date 최신 행만 쓴다(§7 filings 규약)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.rcept_no, f.bsns_year, f.reprt_code, f.filed_date,
+                   EXISTS(SELECT 1 FROM text_extractions te WHERE te.rcept_no = f.rcept_no) AS extracted
+            FROM filings f
+            JOIN (
+                SELECT corp_code, bsns_year, reprt_code, MAX(filed_date) AS max_filed
+                FROM filings WHERE corp_code = %s AND pipeline_status != 'FAILED'
+                GROUP BY corp_code, bsns_year, reprt_code
+            ) latest ON latest.bsns_year = f.bsns_year AND latest.reprt_code = f.reprt_code
+                    AND latest.max_filed = f.filed_date
+            WHERE f.corp_code = %s
+              AND f.pipeline_status IN ('PARSED', 'DIFFED', 'SUMMARIZED')
+            ORDER BY f.bsns_year, f.filed_date
+            """,
+            (corp_code, corp_code),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    return rows if force else [r for r in rows if not r["extracted"]]
+
+
+def chunks_for_risk_extraction(conn, rcept_no: str) -> list[dict]:
+    """리스크 추출 입력 섹션 — 감사의견/주석/사업의 내용/위험요인/지배구조/주주현황.
+    breadcrumb가 text_extractions.source_section(출처 표시)이 된다."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT section_title, canonical_label, breadcrumb, content
+            FROM text_chunks
+            WHERE rcept_no = %s
+              AND canonical_label IN ('주석', '사업의 내용', '위험요인', '지배구조', '주주현황')
+            ORDER BY section_order
+            """,
+            (rcept_no,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def extraction_items(conn, rcept_no: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT category, item_key, payload_json, source_section FROM text_extractions WHERE rcept_no = %s",
+            (rcept_no,),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for r in rows:
+        r["payload"] = json.loads(r.pop("payload_json"))
+    return rows
+
+
+def delete_text_extractions(conn, rcept_no: str) -> None:
+    """재실행 멱등성 — parse/diff 단계와 동일한 replace 규약."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM text_extractions WHERE rcept_no = %s", (rcept_no,))
+
+
+def insert_text_extractions(conn, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO text_extractions
+                (rcept_no, corp_code, category, item_key, payload_json, source_section, model_used)
+            VALUES (%(rcept_no)s, %(corp_code)s, %(category)s, %(item_key)s,
+                    %(payload_json)s, %(source_section)s, %(model_used)s)
+            ON DUPLICATE KEY UPDATE payload_json = VALUES(payload_json),
+                source_section = VALUES(source_section), model_used = VALUES(model_used)
+            """,
+            rows,
+        )
+        return cur.rowcount
+
+
+def insert_dossier_events(conn, rows: list[dict]) -> int:
+    """UNIQUE(uq_dossier_event) 충돌은 무시 — 재실행 멱등성."""
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT IGNORE INTO dossier_events
+                (corp_code, rcept_no, event_type, category, item_key, detail_json)
+            VALUES (%(corp_code)s, %(rcept_no)s, %(event_type)s, %(category)s,
+                    %(item_key)s, %(detail_json)s)
+            """,
+            rows,
+        )
+        return cur.rowcount
+
+
+def risk_states_needing_narrative(conn, corp_code: str) -> list[dict]:
+    """내러티브가 없거나 quant 재계산(computed_at) 이후 갱신 안 된 최신 분기 행."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT quarter, category, state, consecutive_qtrs, quant_signals_json
+            FROM risk_states
+            WHERE corp_code = %s
+              AND quarter = (SELECT MAX(quarter) FROM risk_states WHERE corp_code = %s)
+              AND (llm_updated_at IS NULL OR llm_updated_at < computed_at)
+            ORDER BY category
+            """,
+            (corp_code, corp_code),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for r in rows:
+        raw = r.pop("quant_signals_json")
+        r["quant_signals"] = json.loads(raw) if raw else {}
+    return rows
+
+
+def update_risk_state_text(
+    conn, corp_code: str, quarter: str, category: str,
+    text_signals: dict | None, narrative_ko: str | None, watch_next_ko: str | None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE risk_states
+            SET text_signals_json = %s, narrative_ko = %s, watch_next_ko = %s,
+                llm_updated_at = CURRENT_TIMESTAMP
+            WHERE corp_code = %s AND quarter = %s AND category = %s
+            """,
+            (
+                json.dumps(text_signals, ensure_ascii=False) if text_signals else None,
+                narrative_ko, watch_next_ko, corp_code, quarter, category,
+            ),
         )

@@ -1,8 +1,12 @@
-"""fnlttSinglAcntAll.json 응답 → metrics 테이블 행 변환.
+"""fnlttSinglAcntAll.json 응답 → 계정 행(metric rows) 변환.
 
 순수 변환 로직 (네트워크/DB 없음). dart_parser와 달리 XML을 다루지 않는다 —
 이 API가 이미 IFRS concept과 당기 금액을 구조화해서 주기 때문에 XML 재무제표
 테이블 파싱은 이 값들에 한해서는 필요 없다 (IMPLEMENTATION_PLAN.md §5 순서 2).
+
+원래 metrics 테이블 삽입용이었으나(2026-07-13 테이블 폐기) 지금은
+diff_ingest가 financial_facts의 원본 payload를 읽을 때 인메모리로만 쓴다 —
+darfin-main의 FinancialFactTransformer.java와 동일 로직(양쪽 동기 유지).
 """
 
 from __future__ import annotations

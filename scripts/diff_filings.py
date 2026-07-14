@@ -1,6 +1,6 @@
 """섹션 diff 적재 CLI — Stage 3: PARSED filings → section_diffs.
 
-이미 파싱된 text_chunks/metrics를 비교하므로 DART API 호출 없이 오프라인으로
+이미 파싱된 text_chunks와 financial_facts 캐시를 비교하므로 DART API 호출 없이 오프라인으로
 동작한다 (corp_code 조회용 corpCode.xml 캐시만 필요).
 
 예:

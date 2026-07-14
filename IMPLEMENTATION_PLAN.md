@@ -123,7 +123,7 @@ DART Open API ──▶ [darfin-company-analysis (Python, CLI + cron)]      [dar
    - `section_title`/`breadcrumb`는 각각 VARCHAR(200)/(500)이라 truncate — 실측 최대값은 738자/784자(주석 섹션 중 일부는 TITLE 자리에 문단 전체가 들어오는 사례가 있어 예상보다 김). 표시용 라벨이 아니라 앵커 매칭(`assoc_note`/`atocid`)이 우선이라 truncate 자체는 문제 없음
    - `tables_json`은 표가 있는 섹션만 채움(NULL 허용), 실측 최대 크기 ~1.5MB — DB `max_allowed_packet`(16MB) 내로 여유 있음
    - **이번에 발견**: 로컬 개발 DB(`darfin_dev`)의 `filings` 테이블이 비어 있었음(1-b에서 라이브 수집했다는 기록과 불일치 — 이후 DB가 리셋된 것으로 보임). 이 환경(네트워크 이슈로 라이브 수집 재실행 불가)에선 로컬 XML 자체의 메타데이터(`rcept_no` 앞 8자리=접수일, `parse_filing()`의 `period_to`/`doc_acode`)로 `filings`를 재시딩해 테스트함. 단, 분기보고서는 XML 내부 `DOCUMENT-NAME ACODE`가 1분기/3분기 구분 없이 항상 "11013"이므로(`ingest.py: classify_report()`가 API의 `report_nm` 월로 구분하는 것과 같은 이유) `period_to` 종료월(03→11013, 09→11014)로 직접 보정 — 라이브 수집 경로(`ingest_company`)는 이미 `report_nm` 기반이라 이 문제 없음
-2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과) ✅ **완료, 라이브 검증됨** — `dart_pipeline/metrics.py`(순수 변환, XML 무관) + `metrics_ingest.py`(오케스트레이션) + `scripts/fetch_metrics.py` CLI. 연결(CFS)·별도(OFS) 각각 조회해 저장. 구현 노트:
+2. `fnlttSinglAcntAll`로 `metrics` 적재 → **재무 추이 탭 end-to-end 연결** (LLM 불필요 — 가장 싼 풀스택 성과) ✅ **완료, 라이브 검증됨** *(2026-07-13 `metrics` 테이블 폐기 — `financial_facts` 단일 소스로 이관, §6 마지막 변경 내역 참고)* — `dart_pipeline/metrics.py`(순수 변환, XML 무관) + `metrics_ingest.py`(오케스트레이션) + `scripts/fetch_metrics.py` CLI. 연결(CFS)·별도(OFS) 각각 조회해 저장. 구현 노트:
    - 손익/현금흐름 항목의 분기 이중 열(당기 3개월 vs 누적)은 `thstrm_amount`/`thstrm_add_amount` 두 필드를 `period_qualifier`로 구분해 별도 행으로 저장
    - `account_id`가 `-표준계정코드 미사용-`이면 `concept=None`으로 저장 (라벨만 있는 계정)
    - 자본변동표(SCE)는 12개 표준 섹션에 대응이 없어 저장 대상에서 제외
@@ -177,9 +177,47 @@ DART Open API ──▶ [darfin-company-analysis (Python, CLI + cron)]      [dar
      - **죽은 코드 정리(2026-07-07)**: `main.py`(FastAPI, `/api/analyze` 엔드포인트 하나만 있는 초기 프로토타입)는 이 저장소의 다른 어떤 코드에서도 import/호출되지 않는 완전히 고립된 파일이었음 — 실제 파이프라인은 처음부터 CLI 스크립트 + cron 구조였고 HTTP 서버가 필요했던 적이 없다. 삭제하고 `requirements.txt`에서 `fastapi`/`uvicorn`도 제거(둘 다 `main.py` 말고는 쓰는 곳 없음 — `pydantic`은 `dart_pipeline/llm.py`가 실사용하므로 유지). `README.md`도 이 프로토타입 기준으로 작성돼 있어 CLI 스크립트 구조에 맞게 다시 씀. `.env.prod.bak`(추적 안 되는 스트레이 파일)도 함께 삭제. `dart_pipeline/summarize_ingest.py`(`scripts/summarize_filings.py`)는 겉보기엔 `fast_path.py`로 대체된 것 같지만, `darfin-main`의 그리드 카드 `changeSummary`가 이게 만드는 `llm_summaries` 테이블을 유일하게 읽는 소스라 **삭제하지 않음** — 다만 `run_daily_scan.py`/`run_llm_worker.py` 어디에도 자동으로 연결돼 있지 않아 새 filing의 `changeSummary`가 채워지려면 이 스크립트를 수동으로 돌려야 하는 상태(기존에도 있던 한계, 이번에 재확인).
      - **changeSummary 소스 교체 + summarize 스테이지 삭제(2026-07-07, 두 번째 정리)**: `darfin-main`의 그리드 카드 `changeSummary`가 `llm_summaries` 아무 1건을 읽던 임시 로직 탓에 '주식 사항' 섹션의 날짜 나열 원문이 카드에 그대로 노출되는 문제가 있었음 — `CompanyAnalysisService.latestChangeSummary()`를 최신 filing의 findings 중 최고 심각도 summary를 읽도록 교체(비어 있으면 빈 문자열, 프론트가 대체 문구 표시). 이로써 `llm_summaries`를 읽는 코드가 전무해져, 위 항목에서 "유일한 소비자 때문에 삭제하지 않음"이라 판단했던 `dart_pipeline/summarize_ingest.py`+`scripts/summarize_filings.py`를 삭제(어느 워커에도 연결 안 된 수동 스크립트였음). `llm_summaries` 테이블과 기존 데이터는 그대로 둠(스키마 변경 없음). 같은 날 `darfin-main`의 `entity/analysis` JPA 엔티티 5개(Companies/Filings/LlmSummaries/Metrics/TextChunks)도 삭제 — 어디서도 import되지 않는 데다 `ddl-auto=update` 아래에서 아래 ①번 스키마 드리프트를 일으킨 바로 그 원인이었음. 파이프라인 테이블 조회는 전부 JdbcTemplate로 유지. 재무 추이 API(`financials()`)도 같은 날 재작성 — 기존엔 account_nm만으로 묶어 동명 계정(손익 '당기순이익' vs 현금흐름 '당기순이익', 재무상태 '비지배지분' vs 포괄손익 '비지배지분')이 한 시계열에 섞여 톱니 차트가 됐고, 사업보고서의 연간 총액이 분기 축에 그대로 올라가 매 Q4가 4배 스파이크로 보였음. (statement_type, 정규화된 account_nm)로 묶고(표기 변형 '수익(매출액)'/'(손실)' 접미/분기·반기순이익/공백·각주 마커 접기), 손익은 3개월 행 우선 + 연간은 Q4=연간−3분기누적으로 환산, 현금흐름은 누적→분기 차분으로 환산. 프론트(`FinancialTrendCharts`)는 주요 9개 지표만 기본 노출하고 나머지는 토글로 접음. → 같은 날 2차 개편: `FinancialMetric`에 `statementType`(재무상태표/손익계산서/현금흐름표) 추가, 배열은 (재무제표 장 순서, 원문 내 계정 ord)으로 정렬해 내려줌(`types.js` 갱신). 프론트는 주요 지표 차트 대시보드 + 재무제표별 탭의 스파크라인 행 목록(행 클릭 시 차트 확장, 계정명 검색)으로 재구성 — 전체 차트 일괄 렌더링(구 `FinancialTrendTable` 포함) 제거. `fnlttSinglAcntAll`의 `ord` 필드를 `metrics.ord`에 저장하고 `fetch_metrics.py --force`로 재적재 완료(삼성전자·SK하이닉스 28 filings, 라이브 API에서 ord 100% 확인).
      - **`darfin` DB를 처음부터 재시딩하며 발견한 스키마 드리프트 2건**(사용자가 "darfin db에도 실제 데이터를 채워보자"고 요청 — pipeline/companies/filings/text_chunks/metrics/section_diffs/llm_summaries/findings/company_overview/score_history/llm_jobs를 TRUNCATE 후 `ingest_filings.py`→`run_daily_scan.py`로 처음부터 재수집): ①`text_chunks.section_nm` 컬럼이 `ddl.sql`에 없는데도 `darfin`에 NOT NULL로 남아있어 모든 filing이 파싱 단계에서 즉시 FAILED — `darfin-main`을 예전에 `ddl-auto=update`로 `darfin`에 대고 띄웠을 때 생긴 Hibernate 드리프트(같은 버그가 이전 세션엔 `darfin_dev`에서 발생했었는데 이번엔 `darfin`에도 있었음 — 두 DB 모두 이 위험에 노출됐다는 뜻). `ALTER TABLE text_chunks DROP COLUMN section_nm`으로 제거. ②`metrics.concept`이 `VARCHAR(100)`으로 `ddl.sql`의 `VARCHAR(300)`보다 좁아 재무제표 저장이 전부 `Data too long` 실패 — `ALTER TABLE metrics MODIFY COLUMN concept VARCHAR(300)`으로 맞춤. 두 경우 다 `darfin`이 `ddl.sql` 최신본으로 한 번도 제대로 재생성된 적이 없다는 신호 — 근본 해결은 `darfin`/`darfin_dev` 통일과 함께, `ddl.sql`을 소스오브트루스로 주기적으로 재적용하는 절차 마련.
+     - **`metrics` 테이블 폐기 — 재무 데이터 소유권을 darfin-main으로 이관(2026-07-13)**: 재무 추이 서빙이 `metrics`(파이프라인 배치) + `financial_facts`(darfin-main 라이브 read-through) 이중 소스로 병합되던 구조를 `financial_facts` 단일 소스로 통일. 방향: **Python은 재무 데이터 파이프라인이기를 그만두고 순수 LLM 분석 워커로, DART 데이터 서빙은 전부 darfin-main이 소유**. 변경 내역 — ①파이프라인: `metrics_ingest.py`/`scripts/fetch_metrics.py` 삭제, 후신은 `financial_facts_ingest.py`/`scripts/warm_financial_facts.py`(fnlttSinglAcntAll 원본 rows를 가공 없이 `financial_facts`에 upsert — `report_facts`와 동일한 dual-writer 관례, darfin-main `FinancialFactDao`와 컬럼·negative cache 의미론 동일). `run_daily_scan.py`의 해당 스테이지 교체. ②diff의 수치형 입력: `diff_ingest.py`가 `metrics` 테이블 대신 `financial_facts` payload를 읽어 `metrics.transform()`(순수 함수, 유지 — darfin-main `FinancialFactTransformer.java`와 로직 동기)으로 인메모리 변환. 캐시가 없으면(워밍이 쿼터 초과로 빠진 경우 등) 수치형 엔트리 없이 텍스트 diff만 생성(과거 "알려진 한계 ①"과 동일한 degrade). ③darfin-main: `CompanyAnalysisService.financials()`의 metrics 병합 제거(단일 소스), `FinancialFactsService`는 lookback(730일) 내 stale 기간만 refresh하되 **서빙은 캐시된 전체 기간**(`FinancialFactDao.allFinancialFacts`) — 온보딩/일일 스캔이 lookback 밖 과거 기간을 덥혀 두면 차트 히스토리가 그대로 보존된다. ④`ddl.sql`에서 `metrics` CREATE 제거(신규 설치엔 없음; 기존 DB의 테이블·데이터는 무해하니 그대로 둠, 원하면 수동 DROP). 기존 `metrics`의 과거 데이터는 마이그레이션하지 않는다 — `warm_financial_facts.py`(또는 다음 daily scan)가 filings 전체 기간을 `financial_facts`로 재적재하면 동일 데이터가 채워진다.
    - **범위 밖(다음 작업)**: 커버 대상 회사 확장(현재 삼성전자·SK하이닉스 2개사만).
 
 이 순서의 이유: LLM 비용을 쓰기 전에 모든 단계를 실제 공시로 테스트할 수 있고, LLM은 변경된 구간에 대해서만 과금된다.
+
+## 5.5 AI분석 리스크 레이어 (2026-07-14 신설, job_type='risk_analysis')
+
+기업분석 AI분석 탭의 prescriptive 레이어 — 스키마는 `darfin-main/ddl.sql` §8
+(`derived_metrics`/`risk_states`/`text_extractions`/`dossier_events`,
+`llm_jobs.job_type` 추가). 전 종목 backfill 없음 — 재무추이와 동일한 on-demand.
+
+역할 분담(결정론/LLM 분리 원칙, §2.1과 동일):
+- **Layer 1(Java, `darfin-main`)**: `RiskAnalysisService`가 요청 시점에
+  `financial_facts` read-through(5년 lookback)로 분기 시계열을 얻고
+  `MetricsCalculator`(비율/Altman Z'/Piotroski F/DuPont/accruals/12Q 자기
+  z-score, Q4=연간−3분기누적)와 `RiskStateMachine`(6개 카테고리 ×
+  신규발생/악화/지속/개선/해소/정상/데이터부족, 8Q 미만 데이터부족)을 돌려
+  `derived_metrics`/`risk_states`에 upsert. 정정공시로 수치가 5% 넘게 바뀌면
+  `correction_material` dossier_event(결정론적). LLM 호출 없음.
+- **Layer 2(이 저장소)**: `GET .../ai-analysis`가 내러티브 미준비 회사를
+  `llm_jobs(job_type='risk_analysis')`에 등록 → `run_llm_worker.py`가
+  dispatch → `dart_pipeline/risk_analysis.py`:
+  1. `risk_extraction.py` — text_chunks(주석/사업의 내용/위험요인/지배구조/
+     주주현황)에서 10개 카테고리 구조화 추출. **item_key가 핵심**: 직전
+     공시의 키 목록을 프롬프트에 넣어 새 키 발명 대신 매칭을 강제 —
+     분기 간 set-diff로 `item_appeared`/`item_disappeared` 이벤트 생성
+     (우발부채가 해소 언급 없이 주석에서 사라지는 패턴 — 단일 공시 분석이
+     구조적으로 못 잡는 신호). 모든 항목은 breadcrumb를 `source_section`으로
+     기계 첨부(출처 표시 — 유사투자자문업 방어선).
+  2. `risk_narrative.py` — 최신 분기 `risk_states` 행에 `narrative_ko`와
+     `watch_next_ko`("차기 분기 확인 사항") 생성. 입력은 이미 계산된 상태와
+     신호 스냅샷뿐 — LLM은 절대 계산하지 않는다. 출력은 전 사용자 동일
+     (개인화 없음).
+  quant 컬럼은 Java 소유, 이 워커는 text_signals/narrative/watch_next/
+  llm_updated_at만 쓴다. filing 단위 멱등(replace).
+
+알려진 한계/열린 결정: 상태 임계값은 placeholder(`RiskStateMachine.Thresholds`,
+팀 결정 대상), peer 백분위는 v1 제외(자기 12Q z-score만 —
+`derived_metrics.peer_percentile_json` 예약), restatement_gap은 전기(frmtrm)
+컬럼 미추출로 후속 과제, 주석 섹션은 청크당 20K/총 200K자 상한으로 절단,
+수시공시는 범위 밖.
 
 ## 6. 참고 자료 위치
 

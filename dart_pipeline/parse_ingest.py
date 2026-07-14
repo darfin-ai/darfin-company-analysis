@@ -1,6 +1,6 @@
 """파싱 결과 적재 오케스트레이션: RAW filings → dart_parser → text_chunks (Stage 2 PARSED).
 
-fetch_metrics_for_stock와 달리 DART API를 호출하지 않는다 — 이미 디스크에 있는
+warm_financial_facts_for_stock와 달리 DART API를 호출하지 않는다 — 이미 디스크에 있는
 xml_path를 dart_parser로 파싱해 DB에 반영할 뿐이므로 완전히 오프라인으로 동작한다
 (corp_code 조회용 corpCode.xml 캐시만 필요, load_corp_codes가 24시간 캐시 사용).
 

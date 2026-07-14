@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dart_pipeline import DartClient, db, ingest_company
 from dart_pipeline.corp_codes import load_corp_codes
 from dart_pipeline.diff_ingest import diff_filings_for_stock
-from dart_pipeline.metrics_ingest import fetch_metrics_for_stock
+from dart_pipeline.financial_facts_ingest import warm_financial_facts_for_stock
 from dart_pipeline.overview_ingest import build_deterministic_overview_for_stock
 from dart_pipeline.parse_ingest import parse_filings_for_stock
 from dart_pipeline.report_facts_ingest import QuotaExceededError, fetch_report_facts_for_stock
@@ -66,7 +66,7 @@ def main() -> int:
         try:
             ingest_company(client, stock_code, bgn_de, end_de)
             parse_filings_for_stock(client, stock_code)
-            fetch_metrics_for_stock(client, stock_code)
+            warm_financial_facts_for_stock(client, stock_code)
             try:
                 fetch_report_facts_for_stock(client, stock_code)
             except QuotaExceededError as e:

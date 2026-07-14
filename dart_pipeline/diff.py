@@ -1,6 +1,7 @@
 """섹션 diff 엔진 — 순수 비교 로직 (Stage 3, 네트워크/DB 없음).
 
-입력은 db.load_chunks()/load_metrics()의 행 딕셔너리, 출력은 section_diffs
+입력은 db.load_chunks()의 행 딕셔너리와 financial_facts 기반 계정 행(diff_ingest가
+metrics.transform으로 생성), 출력은 section_diffs
 테이블 삽입용 딕셔너리(= 프론트 SectionDiffEntry와 1:1, ddl.sql §7).
 
 의미론은 darfin-front lib/comparison.js를 따른다:

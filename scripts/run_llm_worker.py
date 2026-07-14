@@ -26,15 +26,57 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from google import genai
 
-from dart_pipeline import db
+from dart_pipeline import DartClient, db
 from dart_pipeline.diff import order_filings, resolve_baselines
 from dart_pipeline.fast_path import process_filing_concurrent
+from dart_pipeline.onboard_ingest import ingest_company_full
+from dart_pipeline.risk_analysis import process_company as process_risk_company
 
 TIME_BUDGET_SECONDS = 50
 
 
-def _process_job(gemini: genai.Client, job: dict) -> bool:
+def _process_onboard_job(dart_client: DartClient, job: dict) -> bool:
+    """job_type='onboard_ingest' — 관심기업 등록 직후의 초기 backfill(LLM 없음).
+    완료되면 filings가 생겨 다음 getCompanyDetail() 호출이 자동으로
+    preview를 벗어나고 ai_insights job도 그때 등록된다(체인은 Spring이 소유)."""
+    corp_code = job["corp_code"]
+    print(f"job #{job['id']} (onboard_ingest) 처리 시작: corp_code={corp_code}")
+    try:
+        result = ingest_company_full(dart_client, corp_code)
+        with db.connection() as conn:
+            db.mark_job_done(conn, job["id"])
+        print(f"job #{job['id']} 완료 — {result.stock_code}: filing {result.filings_ingested}건 신규 수집")
+        return True
+    except Exception as e:  # noqa: BLE001 — job 단위 실패 격리(다른 회사 온보딩은 계속)
+        with db.connection() as conn:
+            db.mark_job_failed(conn, job["id"], str(e))
+        print(f"job #{job['id']} 실패: {e}")
+        return False
+
+
+def _process_risk_job(gemini: genai.Client, job: dict) -> bool:
+    """job_type='risk_analysis' — AI분석 텍스트 레이어(추출/이벤트/내러티브).
+    quant 상태는 Java가 소유하므로 여기서는 텍스트 산출물만 채운다."""
+    corp_code = job["corp_code"]
+    print(f"job #{job['id']} (risk_analysis) 처리 시작: corp_code={corp_code}")
+    ok, detail = process_risk_company(gemini, corp_code)
+    with db.connection() as conn:
+        if ok:
+            db.mark_job_done(conn, job["id"])
+            print(f"job #{job['id']} 완료")
+        else:
+            db.mark_job_failed(conn, job["id"], detail)
+            print(f"job #{job['id']} 실패: {detail}")
+    return ok
+
+
+def _process_job(gemini: genai.Client, dart_client: DartClient, job: dict) -> bool:
     """job 1건(회사 1곳의 밀린 filing 전체)을 처리하고 성공 여부를 반환한다."""
+    job_type = job.get("job_type")
+    if job_type == "onboard_ingest":
+        return _process_onboard_job(dart_client, job)
+    if job_type == "risk_analysis":
+        return _process_risk_job(gemini, job)
     corp_code = job["corp_code"]
     print(f"job #{job['id']} 처리 시작: corp_code={corp_code}")
 
@@ -91,6 +133,7 @@ def _process_job(gemini: genai.Client, job: dict) -> bool:
 
 def main() -> int:
     gemini = genai.Client()
+    dart_client = DartClient()
     deadline = time.monotonic() + TIME_BUDGET_SECONDS
     jobs_seen = 0
     any_failed = False
@@ -107,7 +150,7 @@ def main() -> int:
             break
 
         jobs_seen += 1
-        if not _process_job(gemini, job):
+        if not _process_job(gemini, dart_client, job):
             any_failed = True
 
     if jobs_seen == 0:

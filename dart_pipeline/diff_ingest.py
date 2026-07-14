@@ -1,7 +1,8 @@
 """diff 오케스트레이션: PARSED filings → section_diffs (Stage 3 DIFFED).
 
 공시마다 QoQ/YoY baseline을 결정하고(diff.resolve_baselines), 양쪽의
-text_chunks/metrics를 읽어 diff.diff_pair()를 돌린 뒤 section_diffs에 기록한다.
+text_chunks와 financial_facts(원본 payload → metrics.transform으로 계정 행 변환)를
+읽어 diff.diff_pair()를 돌린 뒤 section_diffs에 기록한다.
 완전히 오프라인으로 동작한다 (DART API 호출 없음 — DB와 이미 파싱된 데이터만).
 
 각 공시는 멱등하게 처리: 재실행 시 기존 section_diffs를 지우고 다시 채운 뒤
@@ -16,6 +17,7 @@ from . import db
 from .client import DartClient
 from .corp_codes import load_corp_codes
 from .diff import diff_pair, headcount_metrics, order_filings, ownership_metrics, resolve_baselines
+from .metrics import transform as transform_financial_facts
 from .report_facts_resolve import facts_ready, resolve_headcount, resolve_ownership
 
 
@@ -48,11 +50,36 @@ def diff_filings_for_stock(client: DartClient, stock_code: str, force: bool = Fa
         filings = db.filings_for_diffing(conn, corp.corp_code, force=force)
         ordered = order_filings(filings)
         parsed_ok = {f["rcept_no"] for f in ordered if f["pipeline_status"] != "RAW"}
+        period_by_rcept = {f["rcept_no"]: (f["bsns_year"], f["reprt_code"]) for f in ordered}
+
+        def load_metric_rows(rcept_no: str) -> list[dict]:
+            """수치형 diff 입력 — financial_facts(원본 payload 캐시, darfin-main과
+            공유)를 metrics.transform으로 계정 행으로 펼친다. 캐시가 아직 없으면
+            (워밍 스테이지가 이 diff보다 먼저 돌지만, 쿼터 초과 등으로 빠졌을 때)
+            빈 리스트 — diff_pair는 수치형 엔트리 없이 텍스트 diff만 만든다."""
+            bsns_year, reprt_code = period_by_rcept[rcept_no]
+            payloads = db.financial_fact_payloads(conn, corp.corp_code, bsns_year, reprt_code)
+            rows: list[dict] = []
+            for fs_div, is_consolidated in (("CFS", True), ("OFS", False)):
+                raw = payloads.get(fs_div)
+                if not raw:
+                    continue
+                rows.extend(
+                    transform_financial_facts(
+                        raw,
+                        rcept_no=rcept_no,
+                        corp_code=corp.corp_code,
+                        bsns_year=bsns_year,
+                        reprt_code=reprt_code,
+                        is_consolidated=is_consolidated,
+                    )
+                )
+            return rows
 
         def load(rcept_no: str) -> tuple[list[dict], list[dict]]:
             if rcept_no not in chunk_cache:
                 chunk_cache[rcept_no] = db.load_chunks(conn, rcept_no)
-                metrics_cache[rcept_no] = db.load_metrics(conn, rcept_no)
+                metrics_cache[rcept_no] = load_metric_rows(rcept_no)
             return chunk_cache[rcept_no], metrics_cache[rcept_no]
 
         for f in ordered:
