@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from google import genai
+from dart_pipeline.llm_runtime import create_client
 
 from dart_pipeline import DartClient
 from dart_pipeline.overview_ingest import build_overview_for_stock
@@ -36,7 +37,7 @@ def main() -> int:
     args = ap.parse_args()
 
     client = DartClient()
-    gemini = genai.Client()
+    gemini = create_client()
     results = build_overview_for_stock(client, gemini, args.stock, force=args.force, limit=args.limit)
 
     if not results:

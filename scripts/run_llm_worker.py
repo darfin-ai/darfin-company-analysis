@@ -31,6 +31,7 @@ from dart_pipeline.diff import order_filings, resolve_baselines
 from dart_pipeline.fast_path import process_filing_concurrent
 from dart_pipeline.onboard_ingest import ingest_company_full
 from dart_pipeline.risk_analysis import process_company as process_risk_company
+from dart_pipeline.llm_runtime import create_client
 
 TIME_BUDGET_SECONDS = 50
 
@@ -132,7 +133,7 @@ def _process_job(gemini: genai.Client, dart_client: DartClient, job: dict) -> bo
 
 
 def main() -> int:
-    gemini = genai.Client()
+    gemini = create_client()
     dart_client = DartClient()
     deadline = time.monotonic() + TIME_BUDGET_SECONDS
     jobs_seen = 0

@@ -213,6 +213,17 @@ DART Open API ──▶ [darfin-company-analysis (Python, CLI + cron)]      [dar
   quant 컬럼은 Java 소유, 이 워커는 text_signals/narrative/watch_next/
   llm_updated_at만 쓴다. filing 단위 멱등(replace).
 
+운영 안전장치(2026-07-15): 모든 Gemini 호출은 공통 런타임을 통해 요청당
+60초 타임아웃과 transient 오류(429/5xx/timeout) 1회 재시도를 적용하고,
+작업별 출력 토큰 상한 및 내용 비노출 latency telemetry를 기록한다. polish diff는
+5건, findings/risks와 risk extraction 섹션은 10건씩 처리하되 findings/risks는 전체 결과를 결정론적으로 중복 제거·
+정렬한 뒤 최대 5건으로 제한한다. 최신 분기 6개 카테고리의 narrative/watch_next가
+모두 최신이고 `llm_updated_at >= computed_at`일 때만 API가 `complete`를
+반환한다. 일반 기업 상세 조회는 UI가 소비하지 않는 legacy `ai_insights` 잡을 더
+이상 자동 등록하지 않는다.
+실패 작업은 GET 조회로 암묵 재등록하지 않고, 열람권을 확인하는 명시적
+`POST .../ai-analysis/retry`에서만 새 잡을 등록한다.
+
 알려진 한계/열린 결정: 상태 임계값은 placeholder(`RiskStateMachine.Thresholds`,
 팀 결정 대상), peer 백분위는 v1 제외(자기 12Q z-score만 —
 `derived_metrics.peer_percentile_json` 예약), restatement_gap은 전기(frmtrm)

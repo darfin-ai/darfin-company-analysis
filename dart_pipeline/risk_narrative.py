@@ -20,7 +20,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
-from .llm import MODEL_NAME, _MAX_OUTPUT_TOKENS, _NO_THINKING
+from .llm import MODEL_NAME, _NO_THINKING
+from .llm_runtime import generate_content
 from .risk_extraction import STATE_CATEGORY_BY_EXTRACTION
 
 _SYSTEM_INSTRUCTION = (
@@ -91,7 +92,10 @@ def generate_narratives(
             "textEvidence": text_by_state_category.get(s["category"], [])[:10],
         })
 
-    response = client.models.generate_content(
+    response = generate_content(
+        client,
+        operation="risk_narrative",
+        item_count=len(entries),
         model=MODEL_NAME,
         contents=json.dumps(entries, ensure_ascii=False),
         config=types.GenerateContentConfig(
@@ -100,7 +104,7 @@ def generate_narratives(
             response_mime_type="application/json",
             response_schema=_NarrativeBatch,
             thinking_config=_NO_THINKING,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=2_000,
         ),
     )
     parsed: _NarrativeBatch | None = response.parsed
@@ -118,6 +122,13 @@ def generate_narratives(
             r.watch_next,
             {"items": evidence} if evidence else None,
         )
+
+    required_categories = {s["category"] for s in states}
+    missing = required_categories - set(by_category)
+    blank = {category for category, values in by_category.items() if not values[0].strip()}
+    if missing or blank:
+        invalid = sorted(missing | blank)
+        raise RuntimeError(f"Gemini 내러티브 필수 카테고리 누락/공백: {', '.join(invalid)}")
 
     usage = response.usage_metadata
     return NarrativeResult(
