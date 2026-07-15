@@ -25,7 +25,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
-from .llm import MODEL_NAME, _MAX_OUTPUT_TOKENS, _NO_THINKING  # 동일 규약 재사용
+from .llm import MODEL_NAME, _NO_THINKING
+from .llm_runtime import generate_content
 
 # ddl.sql §8 text_extractions.category와 1:1.
 CATEGORIES = (
@@ -53,6 +54,8 @@ STATE_CATEGORY_BY_EXTRACTION = {
 # 비용 폭주 방지. 잘린 꼬리는 이번 라운드 범위 밖(알려진 한계).
 _MAX_CHARS_PER_CHUNK = 20_000
 _MAX_TOTAL_CHARS = 200_000
+_MAX_SECTIONS_PER_REQUEST = 10
+_RISK_EXTRACTION_MAX_OUTPUT_TOKENS = 8_000
 
 # 기간이 박힌 item_key 검출 — 이런 키는 분기마다 바뀌어 diff가 전부 잡음이 된다.
 _PERIODIC_KEY = re.compile(r"\d{4}\s*년|\d\s*분기|\d{4}[.\-/]\d{1,2}|반기|사업연도")
@@ -131,58 +134,63 @@ def extract_filing(
     prior_block = json.dumps(
         {k: v for k, v in prior_item_keys.items() if v}, ensure_ascii=False,
     )
-    contents = (
-        f"직전 공시의 기존 키(카테고리별): {prior_block or '없음'}\n\n"
-        + "\n\n===\n\n".join(sections)
-    )
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_INSTRUCTION,
-            temperature=0.1,
-            response_mime_type="application/json",
-            response_schema=_ExtractionBatch,
-            thinking_config=_NO_THINKING,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
-        ),
-    )
-    parsed: _ExtractionBatch | None = response.parsed
-    if parsed is None:
-        raise RuntimeError(
-            f"Gemini 추출 응답이 스키마로 파싱되지 않음 (rcept_no={rcept_no})"
-        )
-
     rows = []
     seen: set[tuple[str, str]] = set()
-    for item in parsed.items:
-        # 환각 section_index 방지 — 없는 index는 버린다 (llm.py evidence_id 검증과 동일).
-        if not (0 <= item.section_index < len(chunks)):
-            continue
-        key = (item.category, item.item_key.strip()[:120])
-        if not key[1] or key in seen:
-            continue
-        seen.add(key)
-        rows.append({
-            "rcept_no": rcept_no,
-            "corp_code": corp_code,
-            "category": item.category,
-            "item_key": key[1],
-            "payload_json": json.dumps(
-                {"summary": item.summary, "amountKrw": item.amount_krw},
-                ensure_ascii=False,
+    tokens_in = tokens_out = 0
+    for start in range(0, len(sections), _MAX_SECTIONS_PER_REQUEST):
+        section_batch = sections[start : start + _MAX_SECTIONS_PER_REQUEST]
+        contents = (
+            f"직전 공시의 기존 키(카테고리별): {prior_block or '없음'}\n\n"
+            + "\n\n===\n\n".join(section_batch)
+        )
+        response = generate_content(
+            client,
+            operation="risk_extraction",
+            item_count=len(section_batch),
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=_SYSTEM_INSTRUCTION,
+                temperature=0.1,
+                response_mime_type="application/json",
+                response_schema=_ExtractionBatch,
+                thinking_config=_NO_THINKING,
+                max_output_tokens=_RISK_EXTRACTION_MAX_OUTPUT_TOKENS,
             ),
-            "source_section": chunks[item.section_index]["breadcrumb"][:500],
-            "model_used": MODEL_NAME,
-        })
+        )
+        parsed: _ExtractionBatch | None = response.parsed
+        if parsed is None:
+            finish = response.candidates[0].finish_reason if response.candidates else "?"
+            raise RuntimeError(
+                f"Gemini 추출 응답이 스키마로 파싱되지 않음 "
+                f"(rcept_no={rcept_no}, sections={len(section_batch)}, finish_reason={finish})"
+            )
+        usage = response.usage_metadata
+        if usage:
+            tokens_in += usage.prompt_token_count or 0
+            tokens_out += usage.candidates_token_count or 0
+        for item in parsed.items:
+            # 프롬프트의 section_index는 filing 전체 chunks의 원래 index다.
+            if not (start <= item.section_index < start + len(section_batch)):
+                continue
+            key = (item.category, item.item_key.strip()[:120])
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "rcept_no": rcept_no,
+                "corp_code": corp_code,
+                "category": item.category,
+                "item_key": key[1],
+                "payload_json": json.dumps(
+                    {"summary": item.summary, "amountKrw": item.amount_krw},
+                    ensure_ascii=False,
+                ),
+                "source_section": chunks[item.section_index]["breadcrumb"][:500],
+                "model_used": MODEL_NAME,
+            })
 
-    usage = response.usage_metadata
-    return ExtractionResult(
-        rows,
-        usage.prompt_token_count or 0 if usage else 0,
-        usage.candidates_token_count or 0 if usage else 0,
-    )
+    return ExtractionResult(rows, tokens_in, tokens_out)
 
 
 def diff_events(

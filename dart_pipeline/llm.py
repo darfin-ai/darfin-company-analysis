@@ -32,6 +32,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+from .llm_runtime import generate_content
+
 MODEL_NAME = "gemini-2.5-flash"
 
 # 대략적인 리스트 가격(2026년 기준, USD/1M 토큰) — 실제 청구액과 다를 수 있다.
@@ -40,13 +42,23 @@ _PRICE_PER_1M_INPUT = 0.30
 _PRICE_PER_1M_OUTPUT = 2.50
 
 # 여기서 하는 4가지 작업(요약/분류/추출)은 다단계 추론이 필요 없어 thinking을
-# 끈다 — 실제로 SK하이닉스 검증 중 20건 배치 하나가 thinking 토큰만 244초
-# 태우다 MAX_TOKENS로 잘려 응답 파싱에 실패하는 걸 확인했다(thinking_budget=0
-# 없이는 출력 토큰 예산을 내부 추론이 다 써버릴 수 있음). thinking을 꺼도
-# 33건짜리 배치는 16384로 여전히 잘렸다 — gemini-2.5-flash의 실제
-# output_token_limit(65536, client.models.get()으로 확인)까지 열어준다.
+# 끈다 — 실제로 SK하이닉스 검증 중 큰 배치가 thinking 토큰을 수분간 소비한
+# 뒤 잘리는 현상을 확인했다. 호출별 출력 상한은 실제 응답 크기에 맞춰 별도로
+# 제한해 느린 runaway generation과 비용을 막는다.
 _NO_THINKING = types.ThinkingConfig(thinking_budget=0)
-_MAX_OUTPUT_TOKENS = 65536
+_POLISH_MAX_OUTPUT_TOKENS = 8_000
+_EXTRACTION_MAX_OUTPUT_TOKENS = 4_000
+_INSIGHT_MAX_OUTPUT_TOKENS = 2_000
+
+# NAVER 검증에서 65536 출력 한도로도 31건 배치가 MAX_TOKENS로 잘리는 걸 확인
+# — 배치 크기 자체를 줄여 호출당 응답 분량을 출력 한도 안에 안전하게 들어오게 한다.
+_MAX_BATCH_SIZE = 10
+_POLISH_BATCH_SIZE = 5
+
+
+def _chunked(items: list, size: int) -> list[list]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
 
 _SYSTEM_INSTRUCTION = (
     "당신은 기업 공시 비교 결과를 요약하는 보조 도구입니다. "
@@ -101,20 +113,33 @@ def _entry_prompt(index: int, entry: DiffEntry) -> str:
 
 
 def polish_diff_entries(client: genai.Client, entries: list[DiffEntry]) -> list[PolishResult]:
-    """diff 엔진이 격리한 거친 before/after 여러 건을 한 번의 호출로 다듬는다.
+    """diff 엔진이 격리한 거친 before/after 여러 건을 다듬는다.
 
-    한 공시(filing)의 narrative diff 항목 전체를 배열로 묶어 보내고, 응답도
-    같은 개수의 배열로 받는다. 토큰/비용은 호출 전체 사용량을 항목별로
-    비례 배분해 기록한다(개별 호출 대비 정밀도는 낮지만 감사 목적 가시성은
-    유지된다).
+    한 공시(filing)의 narrative diff 항목 전체를 _MAX_BATCH_SIZE 단위로 나눠
+    순차 호출하고(하나의 호출로 몰아 보내면 항목이 많은 회사에서 응답이
+    MAX_TOKENS로 잘릴 수 있음), 결과를 원래 순서대로 이어붙인다.
     """
     if not entries:
         return []
+    results: list[PolishResult] = []
+    for chunk in _chunked(entries, _POLISH_BATCH_SIZE):
+        results.extend(_polish_diff_entries_batch(client, chunk))
+    return results
 
+
+def _polish_diff_entries_batch(client: genai.Client, entries: list[DiffEntry]) -> list[PolishResult]:
+    """entries 하나의 배치(<= _MAX_BATCH_SIZE)를 한 번의 호출로 다듬는다.
+
+    토큰/비용은 호출 전체 사용량을 항목별로 비례 배분해 기록한다(개별 호출
+    대비 정밀도는 낮지만 감사 목적 가시성은 유지된다).
+    """
     contents = "\n\n---\n\n".join(_entry_prompt(i, e) for i, e in enumerate(entries))
 
     started = time.monotonic()
-    response = client.models.generate_content(
+    response = generate_content(
+        client,
+        operation="polish_diffs",
+        item_count=len(entries),
         model=MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -123,7 +148,7 @@ def polish_diff_entries(client: genai.Client, entries: list[DiffEntry]) -> list[
             response_mime_type="application/json",
             response_schema=_DiffSummaryBatch,
             thinking_config=_NO_THINKING,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=_POLISH_MAX_OUTPUT_TOKENS,
         ),
     )
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -239,19 +264,50 @@ def _evidence_prompt(item: EvidenceItem) -> str:
 
 
 def extract_findings(client: genai.Client, evidence: list[EvidenceItem]) -> list[FindingCandidate]:
-    """한 filing의 증거 카탈로그를 한 번에 보내 findings 후보를 뽑는다.
+    """한 filing의 증거 카탈로그에서 findings 후보를 뽑는다.
+
+    카탈로그를 _MAX_BATCH_SIZE 단위로 나눠 순차 호출한다(증거가 많은 회사에서
+    응답이 MAX_TOKENS로 잘리는 걸 막기 위함). evidence_id는 전역으로 유일하므로
+    청크별 검증/결과 병합에 문제가 없다.
+    """
+    if not evidence:
+        return []
+    results: list[FindingCandidate] = []
+    for chunk in _chunked(evidence, _MAX_BATCH_SIZE):
+        results.extend(_extract_findings_batch(client, chunk))
+    return _dedupe_findings(results)[:5]
+
+
+def _dedupe_findings(items: list[FindingCandidate]) -> list[FindingCandidate]:
+    """Deterministically merge overlapping chunk results and globally rank them."""
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    unique: dict[tuple[int, ...], FindingCandidate] = {}
+    for item in items:
+        key = tuple(sorted(set(item.evidence_ids)))
+        current = unique.get(key)
+        if current is None or severity_rank.get(item.severity, 3) < severity_rank.get(current.severity, 3):
+            item.evidence_ids = list(key)
+            unique[key] = item
+    return sorted(
+        unique.values(),
+        key=lambda item: (severity_rank.get(item.severity, 3), -len(item.evidence_ids), item.evidence_ids),
+    )
+
+
+def _extract_findings_batch(client: genai.Client, evidence: list[EvidenceItem]) -> list[FindingCandidate]:
+    """evidence 하나의 배치(<= _MAX_BATCH_SIZE)에서 findings 후보를 뽑는다.
 
     응답의 evidence_ids가 실제 카탈로그에 없는 값을 참조하면 그 id만 걸러내고,
     걸러낸 뒤 evidence_ids가 비게 된 finding은 통째로 버린다(모델이 근거 없이
     지어낸 finding을 신뢰하지 않는다).
     """
-    if not evidence:
-        return []
-
     valid_ids = {item.evidence_id for item in evidence}
     contents = "\n\n---\n\n".join(_evidence_prompt(item) for item in evidence)
 
-    response = client.models.generate_content(
+    response = generate_content(
+        client,
+        operation="extract_findings",
+        item_count=len(evidence),
         model=MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -260,7 +316,7 @@ def extract_findings(client: genai.Client, evidence: list[EvidenceItem]) -> list
             response_mime_type="application/json",
             response_schema=_FindingBatch,
             thinking_config=_NO_THINKING,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=_EXTRACTION_MAX_OUTPUT_TOKENS,
         ),
     )
 
@@ -331,16 +387,44 @@ class RiskCandidate:
 def extract_risks(client: genai.Client, evidence: list[EvidenceItem]) -> list[RiskCandidate]:
     """위험요인 청크를 문단 단위로 쪼갠 evidence에서 핵심 리스크를 뽑는다.
 
-    extract_findings와 동일한 검증 원칙: evidence_ids가 카탈로그에 없으면
-    걸러내고, 다 걸러지면 해당 리스크는 버린다.
+    extract_findings와 동일하게 _MAX_BATCH_SIZE 단위로 나눠 순차 호출한다.
     """
     if not evidence:
         return []
+    results: list[RiskCandidate] = []
+    for chunk in _chunked(evidence, _MAX_BATCH_SIZE):
+        results.extend(_extract_risks_batch(client, chunk))
+    return _dedupe_risks(results)[:5]
 
+
+def _dedupe_risks(items: list[RiskCandidate]) -> list[RiskCandidate]:
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    unique: dict[tuple[int, ...], RiskCandidate] = {}
+    for item in items:
+        key = tuple(sorted(set(item.evidence_ids)))
+        current = unique.get(key)
+        if current is None or severity_rank.get(item.severity, 3) < severity_rank.get(current.severity, 3):
+            item.evidence_ids = list(key)
+            unique[key] = item
+    return sorted(
+        unique.values(),
+        key=lambda item: (severity_rank.get(item.severity, 3), -len(item.evidence_ids), item.evidence_ids),
+    )
+
+
+def _extract_risks_batch(client: genai.Client, evidence: list[EvidenceItem]) -> list[RiskCandidate]:
+    """evidence 하나의 배치(<= _MAX_BATCH_SIZE)에서 핵심 리스크를 뽑는다.
+
+    extract_findings와 동일한 검증 원칙: evidence_ids가 카탈로그에 없으면
+    걸러내고, 다 걸러지면 해당 리스크는 버린다.
+    """
     valid_ids = {item.evidence_id for item in evidence}
     contents = "\n\n---\n\n".join(_evidence_prompt(item) for item in evidence)
 
-    response = client.models.generate_content(
+    response = generate_content(
+        client,
+        operation="extract_risks",
+        item_count=len(evidence),
         model=MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -349,7 +433,7 @@ def extract_risks(client: genai.Client, evidence: list[EvidenceItem]) -> list[Ri
             response_mime_type="application/json",
             response_schema=_RiskBatch,
             thinking_config=_NO_THINKING,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=_EXTRACTION_MAX_OUTPUT_TOKENS,
         ),
     )
 
@@ -413,13 +497,28 @@ def _panel_prompt(index: int, fact: PanelFact) -> str:
 
 
 def generate_panel_insights(client: genai.Client, panels: list[PanelFact]) -> list[str]:
-    """여러 패널의 결정론적 수치 요약을 한 번에 보내 'So what?' 한 줄씩 받는다."""
+    """여러 패널의 결정론적 수치 요약에서 'So what?' 한 줄씩 받는다.
+
+    다른 세 함수와 동일하게 _MAX_BATCH_SIZE 단위로 나눠 순차 호출한다(패널
+    개수는 보통 5개 이하라 실질적으로 청크 1개뿐이지만, 일관성을 위해 동일한
+    방식을 쓴다).
+    """
     if not panels:
         return []
+    results: list[str] = []
+    for chunk in _chunked(panels, _MAX_BATCH_SIZE):
+        results.extend(_generate_panel_insights_batch(client, chunk))
+    return results
 
+
+def _generate_panel_insights_batch(client: genai.Client, panels: list[PanelFact]) -> list[str]:
+    """panels 하나의 배치(<= _MAX_BATCH_SIZE)에서 'So what?' 한 줄씩 받는다."""
     contents = "\n\n---\n\n".join(_panel_prompt(i, p) for i, p in enumerate(panels))
 
-    response = client.models.generate_content(
+    response = generate_content(
+        client,
+        operation="panel_insights",
+        item_count=len(panels),
         model=MODEL_NAME,
         contents=contents,
         config=types.GenerateContentConfig(
@@ -428,7 +527,7 @@ def generate_panel_insights(client: genai.Client, panels: list[PanelFact]) -> li
             response_mime_type="application/json",
             response_schema=_PanelInsightBatch,
             thinking_config=_NO_THINKING,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=_INSIGHT_MAX_OUTPUT_TOKENS,
         ),
     )
 
