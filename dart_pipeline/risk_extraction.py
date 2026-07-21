@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -134,16 +135,17 @@ def extract_filing(
     prior_block = json.dumps(
         {k: v for k, v in prior_item_keys.items() if v}, ensure_ascii=False,
     )
-    rows = []
-    seen: set[tuple[str, str]] = set()
-    tokens_in = tokens_out = 0
-    for start in range(0, len(sections), _MAX_SECTIONS_PER_REQUEST):
-        section_batch = sections[start : start + _MAX_SECTIONS_PER_REQUEST]
+    batches = [
+        (start, sections[start : start + _MAX_SECTIONS_PER_REQUEST])
+        for start in range(0, len(sections), _MAX_SECTIONS_PER_REQUEST)
+    ]
+
+    def _call_batch(start: int, section_batch: list[str]):
         contents = (
             f"직전 공시의 기존 키(카테고리별): {prior_block or '없음'}\n\n"
             + "\n\n===\n\n".join(section_batch)
         )
-        response = generate_content(
+        return generate_content(
             client,
             operation="risk_extraction",
             item_count=len(section_batch),
@@ -158,6 +160,21 @@ def extract_filing(
                 max_output_tokens=_RISK_EXTRACTION_MAX_OUTPUT_TOKENS,
             ),
         )
+
+    # 배치끼리는 서로 다른 섹션 구간을 보는 독립 호출이라(직전 공시 키 목록만
+    # 공유 입력으로 쓰고 배치 간 결과 의존은 없음) 동시에 던질 수 있다 —
+    # 주석이 많은 대기업 filing 하나가 여러 배치로 쪼개질 때 순차 호출이던
+    # 부분을 병렬화해 그 filing의 처리 시간을 줄인다.
+    if len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=min(len(batches), 4)) as pool:
+            responses = list(pool.map(lambda b: _call_batch(*b), batches))
+    else:
+        responses = [_call_batch(*b) for b in batches]
+
+    rows = []
+    seen: set[tuple[str, str]] = set()
+    tokens_in = tokens_out = 0
+    for (start, section_batch), response in zip(batches, responses):
         parsed: _ExtractionBatch | None = response.parsed
         if parsed is None:
             finish = response.candidates[0].finish_reason if response.candidates else "?"
