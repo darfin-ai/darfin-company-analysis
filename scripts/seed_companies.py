@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dart_pipeline import DartClient, db
+from dart_pipeline.company_names import canonical_company_name
 from dart_pipeline.corp_codes import load_corp_codes
 
 # (종목코드, 회사명, 시장, 업종) — 업종은 카드 표시용 라벨
@@ -81,7 +82,9 @@ def main() -> int:
                 print(f"✗ {name}({stock_code}): corpCode.xml에 종목코드 없음 — 스킵")
                 failed += 1
                 continue
-            if _normalize_name(entry.corp_name) != _normalize_name(name):
+            dart_name = canonical_company_name(stock_code, entry.corp_name)
+            seed_name = canonical_company_name(stock_code, name)
+            if _normalize_name(dart_name) != _normalize_name(seed_name):
                 # 종목코드로 찾은 DART 회사명이 시드 목록과 다르면 목록 오타나
                 # 코드 재사용 가능성 — 눈으로 확인 전까지 등록하지 않는다.
                 print(f"✗ {name}({stock_code}): DART 회사명 불일치 ('{entry.corp_name}') — 스킵")
@@ -98,7 +101,7 @@ def main() -> int:
                     "VALUES (%s, %s, %s, %s) "
                     "ON DUPLICATE KEY UPDATE company_name = VALUES(company_name), "
                     "  stock_code = VALUES(stock_code), market_type = VALUES(market_type)",
-                    (entry.corp_name, entry.corp_code, stock_code, market),
+                    (seed_name, entry.corp_code, stock_code, market),
                 )
                 cur.execute(
                     "INSERT INTO companies (corp_code, sector) VALUES (%s, %s) "

@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import pymysql
 
 from .config import DB_CONFIG
+from .company_names import canonical_company_name
 
 
 @contextmanager
@@ -29,10 +30,11 @@ def connection():
 
 def ensure_company(conn, corp_code: str, corp_name: str, stock_code: str | None) -> None:
     """stock → companies 순으로 FK 사슬을 만족시키며 없으면 생성."""
+    display_name = canonical_company_name(stock_code, corp_name)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT IGNORE INTO stock (company_name, dart_corp_code, stock_code) VALUES (%s, %s, %s)",
-            (corp_name, corp_code, stock_code),
+            (display_name, corp_code, stock_code),
         )
         cur.execute("INSERT IGNORE INTO companies (corp_code) VALUES (%s)", (corp_code,))
 
